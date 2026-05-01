@@ -56,11 +56,21 @@ def _process_audio(
             job_store.set_audio(task_id, audio_files)
         logger.info("[%s] set_result 호출 (keys: %s)", task_id, list(result.keys()))
         job_store.set_result(task_id, result)
-        # Verify
+        # Verify — race가 발생하면 set_result가 무시했을 수 있음 (terminal guard / evicted)
         stored = job_store.get(task_id)
-        logger.info("[%s] 저장 검증: status=%s result_keys=%s", task_id,
-                     stored.status if stored else "NONE",
-                     list(stored.result.keys()) if stored and stored.result else "NONE")
+        if stored is None or stored.result is None:
+            logger.error(
+                "[%s] CRITICAL: set_result 후 결과 부재 — race 의심. "
+                "stored=%s result_keys=%s",
+                task_id,
+                stored.status.value if stored else "NONE",
+                list(stored.result.keys()) if stored and stored.result else "NONE",
+            )
+        else:
+            logger.info(
+                "[%s] 저장 검증: status=%s result_keys=%s",
+                task_id, stored.status.value, list(stored.result.keys()),
+            )
     except Exception as e:
         logger.error("[%s] Processing failed: %s", task_id, e)
         job_store.set_error(task_id, str(e))
@@ -193,7 +203,9 @@ async def transcribe_audio(
         )
 
     # 임시 저장 경로 준비
-    task_id = uuid.uuid4().hex[:12]
+    # task_id = uuid 8자(32-bit) + microsecond 6자 = 14자.
+    # 12자 hex 단독 시 동시 100+ 요청에서 collision 이론적 가능 — timestamp로 사실상 불가능화.
+    task_id = f"{uuid.uuid4().hex[:8]}{int(time.time() * 1_000_000) % 1_000_000:06d}"
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     file_path = config.TEMP_DIR / f"{task_id}.{ext}"
 

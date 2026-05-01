@@ -66,23 +66,55 @@ class JobStore:
         with self._lock:
             if task_id in self._tasks:
                 task = self._tasks[task_id]
+                # Terminal state guard: 이미 completed/failed면 status 변경 금지 (race overwrite 방지)
+                if task.status in (TaskStatus.completed, TaskStatus.failed):
+                    logger.warning(
+                        "[%s] update_status race: terminal=%s → ignored new=%s",
+                        task_id, task.status.value, status.value,
+                    )
+                    return
                 self._tasks[task_id] = task.model_copy(update={"status": status})
 
     def set_result(self, task_id: str, result: dict) -> None:
         with self._lock:
-            if task_id in self._tasks:
-                task = self._tasks[task_id]
-                self._tasks[task_id] = task.model_copy(
-                    update={"status": TaskStatus.completed, "result": result}
+            if task_id not in self._tasks:
+                # Race: task evicted before result arrived. 호출자가 검증/재시도 결정.
+                logger.error(
+                    "[%s] set_result race: task evicted before completion — result lost",
+                    task_id,
                 )
+                return
+            task = self._tasks[task_id]
+            # Terminal state guard: 이미 completed/failed인 task에 set_result 시도 차단
+            if task.status in (TaskStatus.completed, TaskStatus.failed):
+                logger.error(
+                    "[%s] set_result race: terminal=%s → duplicate set_result ignored",
+                    task_id, task.status.value,
+                )
+                return
+            self._tasks[task_id] = task.model_copy(
+                update={"status": TaskStatus.completed, "result": result}
+            )
 
     def set_error(self, task_id: str, error: str) -> None:
         with self._lock:
-            if task_id in self._tasks:
-                task = self._tasks[task_id]
-                self._tasks[task_id] = task.model_copy(
-                    update={"status": TaskStatus.failed, "error": error}
+            if task_id not in self._tasks:
+                logger.error(
+                    "[%s] set_error race: task evicted before error reported — error lost",
+                    task_id,
                 )
+                return
+            task = self._tasks[task_id]
+            # Terminal state guard
+            if task.status in (TaskStatus.completed, TaskStatus.failed):
+                logger.warning(
+                    "[%s] set_error race: terminal=%s → duplicate set_error ignored",
+                    task_id, task.status.value,
+                )
+                return
+            self._tasks[task_id] = task.model_copy(
+                update={"status": TaskStatus.failed, "error": error}
+            )
 
     def update_gpu_acquired(self, task_id: str) -> None:
         """GPU 세마포어 획득 시각 기록 (관측용)."""
@@ -207,12 +239,28 @@ class JobStore:
             if age > MAX_COMPLETED_AGE_SEC and task.status in (TaskStatus.completed, TaskStatus.failed):
                 expired.append(task_id)
 
-        # Also evict oldest if over max size
+        # Over-size eviction: pending/processing은 절대 evict 안 함 (race outlier 방지).
+        # 완료/실패 task만 가장 오래된 것부터 제거. MAX_STORE_SIZE는 soft-cap.
         if len(self._tasks) > MAX_STORE_SIZE:
-            by_age = sorted(self._timestamps.items(), key=lambda x: x[1])
-            for task_id, _ in by_age[:len(self._tasks) - MAX_STORE_SIZE]:
+            terminal_by_age = sorted(
+                (
+                    (tid, ts) for tid, ts in self._timestamps.items()
+                    if (t := self._tasks.get(tid)) is not None
+                    and t.status in (TaskStatus.completed, TaskStatus.failed)
+                ),
+                key=lambda x: x[1],
+            )
+            need_evict = len(self._tasks) - MAX_STORE_SIZE
+            for task_id, _ in terminal_by_age[:need_evict]:
                 if task_id not in expired:
                     expired.append(task_id)
+            # active(pending/processing) > MAX_STORE_SIZE면 soft-cap 초과 허용 (백프레셔는 active_count로)
+            active_only = len(self._tasks) - len(expired)
+            if active_only > MAX_STORE_SIZE:
+                logger.warning(
+                    "JobStore over soft-cap: active=%d > MAX_STORE_SIZE=%d (백프레셔 active_count로 통제)",
+                    active_only, MAX_STORE_SIZE,
+                )
 
         results_dir = self._get_results_dir()
         for task_id in expired:
