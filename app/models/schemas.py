@@ -210,12 +210,7 @@ class UtteranceResult(BaseModel):
     )
     emotion: Optional[str] = Field(
         None,
-        description="자동 예측 세부감정 7종 (기쁨|놀람|슬픔|분노|불안|당황|중립). 모델 없을 때 null.",
-        examples=["기쁨"],
-    )
-    emotion_category: Optional[str] = Field(
-        None,
-        description="상위 카테고리 3종 (긍정|중립|부정). emotion 에서 파생, 모델 미학습.",
+        description="자동 예측 감정 3종 (긍정|중립|부정). 모델 없을 때 null.",
         examples=["긍정"],
     )
     emotion_confidence: Optional[float] = Field(

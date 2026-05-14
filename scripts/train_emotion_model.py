@@ -193,10 +193,20 @@ def _save_model(model: EmotionClassifier, tokenizer, output_dir: Path) -> None:
     logger.info("모델 저장 완료: %s", output_dir)
 
 
+_external_status_file: Path | None = None  # set by main() when --status-file is passed
+
+
 def _write_status(output_dir: Path, status: dict) -> None:
     (output_dir / "training_status.json").write_text(
         json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if _external_status_file is not None:
+        try:
+            _external_status_file.write_text(
+                json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
 
 def _update_current_symlink(models_root: Path, version_dir: Path) -> None:
@@ -465,7 +475,13 @@ def main() -> None:
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--job-id", default=None, help="라우터가 부여한 job ID (상태 추적용)")
+    parser.add_argument("--status-file", default=None, help="외부 상태 파일 경로 (라우터 폴링용)")
     args = parser.parse_args()
+
+    global _external_status_file
+    if args.status_file:
+        _external_status_file = Path(args.status_file)
 
     if not args.dummy and not Path(args.train_csv).exists():
         logger.error("학습 CSV 없음: %s -- --dummy 또는 prepare_emotion_dataset.py 먼저 실행", args.train_csv)

@@ -810,12 +810,10 @@ def transcribe(
             labels = auto_label_service.predict(texts)
             for u, lbl in zip(utterances_result, labels):
                 u["emotion"] = lbl.emotion
-                u["emotion_category"] = lbl.emotion_category
                 u["emotion_confidence"] = lbl.emotion_confidence
+                u["dialog_act"] = lbl.dialog_act
                 u["dialog_act_confidence"] = lbl.dialog_act_confidence
                 u["auto_label_model_version"] = lbl.model_version
-                if lbl.dialog_act:
-                    u["dialog_act"] = lbl.dialog_act
 
         # 오디오 통계 계산
         file_size = file_path.stat().st_size if file_path.exists() else 0
