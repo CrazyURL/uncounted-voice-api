@@ -142,10 +142,10 @@ class TranscribeAcceptedResponse(BaseModel):
 
     task_id: str = Field(
         ...,
-        description="작업 추적용 고유 ID (12자 hex)",
-        examples=["a1b2c3d4e5f6"],
+        description="작업 추적용 고유 ID (14자 hex)",
+        examples=["a1b2c3d4140000"],
         min_length=12,
-        max_length=12,
+        max_length=14,
     )
     status: str = Field(
         "pending",
