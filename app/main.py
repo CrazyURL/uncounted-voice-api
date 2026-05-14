@@ -6,7 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import config
-from app.routers import health, transcribe
+from app.routers import health, transcribe, training
+from app.services.auto_label_service import auto_label_service
 from app.services.whisperx_service import whisperx_service
 
 logging.basicConfig(
@@ -27,6 +28,8 @@ async def lifespan(app: FastAPI):
         logger.info("TESTING=1 — 모델 로딩 스킵")
     else:
         whisperx_service.load_models()
+        # AutoLabelService는 lazy load — 첫 is_available() 호출 시 모델 탐색
+        auto_label_service  # noqa: B018 — import-time singleton 초기화 확인
         logger.info("=" * 50)
         logger.info("모델 로딩 완료 - 요청 대기 중")
         logger.info("=" * 50)
@@ -94,3 +97,4 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(transcribe.router)
+app.include_router(training.router)
