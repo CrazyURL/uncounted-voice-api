@@ -784,6 +784,14 @@ def transcribe(
                     })
                 logger.info("[%s] 화자 %d명 오디오 분리 완료", task_id, len(speaker_audio_result))
 
+        # 전처리(+ PII 마스킹) 완료된 오디오를 _preprocessed_audio.wav 로 출력.
+        # gpu-worker 가 이 파일을 S3 의 raw_audio_url 경로에 덮어써서
+        # 발화 startSec/endSec 가 재생 위치와 일치하도록 한다.
+        # 청크 모드(audio is None)에서는 단일 배열이 없으므로 생략.
+        if audio is not None:
+            audio_files["_preprocessed_audio.wav"] = to_wav_bytes(audio, config.SAMPLE_RATE)
+            logger.info("[%s] _preprocessed_audio.wav 추가됨 (%.1fs)", task_id, len(audio) / config.SAMPLE_RATE)
+
         elapsed = time.time() - start
 
         # Bug 7 안전망: pyannote/recluster 결과의 speaker_id 갭(SPEAKER_03 누락 등)이나
@@ -794,6 +802,18 @@ def transcribe(
             utterances=utterances_result,
             speaker_audio=speaker_audio_result,
         )
+
+        # 자동 감정/대화행위 라벨링 (모델 없을 때 graceful degradation)
+        from app.services.auto_label_service import auto_label_service
+        if utterances_result and auto_label_service.is_available():
+            texts = [u["transcript_text"] for u in utterances_result]
+            labels = auto_label_service.predict(texts)
+            for u, lbl in zip(utterances_result, labels):
+                u["emotion"] = lbl.emotion
+                u["emotion_confidence"] = lbl.emotion_confidence
+                u["dialog_act"] = lbl.dialog_act
+                u["dialog_act_confidence"] = lbl.dialog_act_confidence
+                u["auto_label_model_version"] = lbl.model_version
 
         # 오디오 통계 계산
         file_size = file_path.stat().st_size if file_path.exists() else 0

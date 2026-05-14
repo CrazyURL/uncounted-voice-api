@@ -208,6 +208,26 @@ class UtteranceResult(BaseModel):
         None,
         description="발화 내 단어 단위 타임스탬프 목록",
     )
+    emotion: Optional[str] = Field(
+        None,
+        description="자동 예측 감정 3종 (긍정|중립|부정). 모델 없을 때 null.",
+        examples=["긍정"],
+    )
+    emotion_confidence: Optional[float] = Field(
+        None,
+        description="감정 예측 신뢰도 0.0–1.0. ≥0.85=auto_confirmed, 0.60–0.85=auto_review, <0.60=needs_review",
+        examples=[0.92],
+    )
+    dialog_act_confidence: Optional[float] = Field(
+        None,
+        description="대화행위 예측 신뢰도 0.0–1.0",
+        examples=[0.78],
+    )
+    auto_label_model_version: Optional[str] = Field(
+        None,
+        description="예측에 사용된 모델 버전 (예: v20250513_120000)",
+        examples=["v20250513_120000"],
+    )
 
 
 class SpeakerAudioResult(BaseModel):

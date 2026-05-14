@@ -415,10 +415,10 @@ async def transcribe_audio(
 async def get_job_status(
     task_id: str = Path(
         ...,
-        description="업로드 시 반환받은 12자 hex 작업 ID",
-        examples=["a1b2c3d4e5f6"],
+        description="업로드 시 반환받은 작업 ID",
+        examples=["a1b2c3d4140000"],
         min_length=12,
-        max_length=12,
+        max_length=14,
     ),
 ):
     task = job_store.get(task_id)
@@ -508,9 +508,9 @@ async def download_split_audio(
     task_id: str = Path(
         ...,
         description="작업 ID",
-        examples=["a1b2c3d4e5f6"],
+        examples=["a1b2c3d4140000"],
         min_length=12,
-        max_length=12,
+        max_length=14,
     ),
     filename: str = Path(
         ...,
