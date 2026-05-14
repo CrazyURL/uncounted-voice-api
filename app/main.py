@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import config
-from app.routers import health, transcribe
+from app.routers import health, transcribe, training
 from app.services.whisperx_service import whisperx_service
 
 logging.basicConfig(
@@ -94,3 +94,4 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(transcribe.router)
+app.include_router(training.router)
