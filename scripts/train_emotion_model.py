@@ -1,345 +1,450 @@
 """
-KcELECTRA 감정/대화행위 멀티태스크 파인튜닝 스크립트
+KcELECTRA 감정 + 대화행위 멀티태스크 파인튜닝
 
 사용법:
-  python scripts/train_emotion_model.py [옵션]
+  python scripts/train_emotion_model.py [--dummy] [options]
 
-주요 옵션:
-  --base-model-path   HuggingFace 모델 ID 또는 로컬 경로 (기본: snunlp/KR-ELECTRA-discriminator)
-  --previous-model-path  이전 버전 경로 (증분 파인튜닝)
-  --data-dir          학습 데이터 디렉토리 (기본: data/emotion)
-  --output-base-dir   모델 출력 베이스 디렉토리 (기본: models/emotion)
-  --job-id            상태 추적용 UUID (training router 에서 전달)
-  --status-file       학습 상태를 기록할 JSON 파일 경로
-  --dummy             더미 10-sample CPU 전용 동작 검증 모드
+  --dummy               CPU 소규모 테스트 (40샘플, 2에포크, max_len=32)
+  --train-csv PATH      학습 CSV (기본: data/emotion/train.csv)
+  --val-csv PATH        검증 CSV (기본: data/emotion/val.csv)
+  --output-dir DIR      모델 저장 루트 (기본: models/emotion)
+  --base-model-path     베이스 모델 (기본: snunlp/KR-ELECTRA-discriminator)
+  --previous-model-path 이전 모델 경로 (증분 파인튜닝 시)
+  --max-epochs N        최대 에포크 (기본: 5)
+  --batch-size N        배치 크기 (기본: 32)
+  --lr FLOAT            학습률 (기본: 2e-5)
+  --max-len N           최대 토큰 길이 (기본: 256)
+  --seed N              랜덤 시드 (기본: 42)
+  --cpu                 GPU 있어도 CPU 강제 사용
+
+출력:
+  models/emotion/v{YYYYMMDD_HHMMSS}/
+    encoder/            AutoModel.save_pretrained
+    tokenizer/          AutoTokenizer.save_pretrained
+    heads.pt            emotion_head + dialog_act_head state_dicts
+    label_map.json      EMOTION_LABELS, DIALOG_ACT_LABELS
+    metrics.json        학습 완료 후 최종 지표
+    training_status.json 실시간 진행 상황
+  models/emotion/current  symlink (Linux) 또는 current.txt (Windows)
 """
-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
 import logging
-import os
-import shutil
-import sys
+import random
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-EMOTION_LABELS = ["기쁨", "놀람", "슬픔", "분노", "불안", "당황", "중립"]
+# ---------------------------------------------------------------------------
+# 상수
+# ---------------------------------------------------------------------------
 
-# 세부감정 → 상위 카테고리 파생 (모델 미학습, 추론 시 계산)
-EMOTION_TO_CATEGORY: dict[str, str] = {
-    "기쁨": "긍정", "놀람": "긍정",
-    "슬픔": "부정", "분노": "부정", "불안": "부정", "당황": "부정",
-    "중립": "중립",
-}
+EMOTION_LABELS = ["긍정", "중립", "부정"]
+EMOTION2ID = {v: i for i, v in enumerate(EMOTION_LABELS)}
 
 DIALOG_ACT_LABELS = [
     "진술", "질문", "요청", "감사", "인사", "사과",
     "동의", "반대", "확인", "부정", "응답", "제안",
     "명령", "감탄", "기타",
 ]
+DIALOG_ACT2ID = {v: i for i, v in enumerate(DIALOG_ACT_LABELS)}
 
-EMOTION_TO_IDX = {e: i for i, e in enumerate(EMOTION_LABELS)}
-DIALOG_ACT_TO_IDX = {d: i for i, d in enumerate(DIALOG_ACT_LABELS)}
-
-
-# ---------------------------------------------------------------------------
-# 상태 파일 유틸
-# ---------------------------------------------------------------------------
-
-def write_status(status_file: Optional[Path], data: dict) -> None:
-    if status_file is None:
-        return
-    try:
-        status_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.warning("상태 파일 쓰기 실패: %s", e)
+DEFAULT_BASE_MODEL = "snunlp/KR-ELECTRA-discriminator"
+ALPHA_EMOTION = 0.7
+ALPHA_DIALOG_ACT = 0.3
+EARLY_STOP_PATIENCE = 3
 
 
 # ---------------------------------------------------------------------------
-# 더미 데이터셋
+# 더미 데이터
 # ---------------------------------------------------------------------------
 
-def make_dummy_dataset():
-    """torch Dataset 반환 (10건, CPU 전용 학습 검증용)"""
-    import torch
-    from torch.utils.data import Dataset
-
-    class DummyDataset(Dataset):
-        def __init__(self, tokenizer, n=10):
-            texts = [f"테스트 발화 {i}" for i in range(n)]
-            emotions = [i % len(EMOTION_LABELS) for i in range(n)]
-            dialog_acts = [i % len(DIALOG_ACT_LABELS) for i in range(n)]
-            self.encodings = tokenizer(
-                texts, padding=True, truncation=True, max_length=64, return_tensors="pt"
-            )
-            self.emotions = torch.tensor(emotions)
-            self.dialog_acts = torch.tensor(dialog_acts)
-
-        def __len__(self):
-            return len(self.emotions)
-
-        def __getitem__(self, idx):
-            return {
-                "input_ids": self.encodings["input_ids"][idx],
-                "attention_mask": self.encodings["attention_mask"][idx],
-                "token_type_ids": self.encodings.get("token_type_ids", None),
-                "emotion_label": self.emotions[idx],
-                "dialog_act_label": self.dialog_acts[idx],
-            }
-
-    return DummyDataset
-
-
-# ---------------------------------------------------------------------------
-# CSV 데이터셋
-# ---------------------------------------------------------------------------
-
-def load_csv_dataset(tokenizer, csv_path: Path, max_len: int = 256):
-    import torch
-    from torch.utils.data import Dataset
-
+def make_dummy_rows(n: int = 40) -> list[dict]:
+    templates = [
+        ("오늘 정말 기분이 좋아요", "긍정", "진술"),
+        ("이게 무슨 뜻인가요", "중립", "질문"),
+        ("너무 화가 나서 참을 수가 없어요", "부정", "감탄"),
+        ("감사합니다 덕분에 살았어요", "긍정", "감사"),
+        ("이 제품을 환불하고 싶습니다", "중립", "요청"),
+        ("오늘 날씨가 흐리네요", "중립", "진술"),
+        ("정말 슬프고 괴롭습니다", "부정", "진술"),
+        ("좋아요 그렇게 하겠습니다", "긍정", "동의"),
+        ("아니요 그건 아닌 것 같아요", "중립", "반대"),
+        ("드디어 원하던 회사에 합격했어요", "긍정", "진술"),
+    ]
     rows = []
-    with csv_path.open(encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            emotion_idx = EMOTION_TO_IDX.get(row.get("emotion", ""), 1)
-            dialog_idx = DIALOG_ACT_TO_IDX.get(row.get("dialog_act", "기타"), 14)
-            rows.append((row["text"], emotion_idx, dialog_idx))
-
-    texts = [r[0] for r in rows]
-    emotions = torch.tensor([r[1] for r in rows])
-    dialog_acts = torch.tensor([r[2] for r in rows])
-    encodings = tokenizer(texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
-
-    class CsvDataset(Dataset):
-        def __len__(self):
-            return len(emotions)
-
-        def __getitem__(self, idx):
-            item = {
-                "input_ids": encodings["input_ids"][idx],
-                "attention_mask": encodings["attention_mask"][idx],
-                "emotion_label": emotions[idx],
-                "dialog_act_label": dialog_acts[idx],
-            }
-            if "token_type_ids" in encodings:
-                item["token_type_ids"] = encodings["token_type_ids"][idx]
-            return item
-
-    return CsvDataset()
+    for i in range(n):
+        tpl = templates[i % len(templates)]
+        rows.append({"text": f"{tpl[0]} {i}", "emotion": tpl[1], "dialog_act": tpl[2]})
+    return rows
 
 
 # ---------------------------------------------------------------------------
-# 학습 루프
+# Dataset
 # ---------------------------------------------------------------------------
 
-def train(args, status_file: Optional[Path]) -> None:
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader
-    from transformers import AutoModel, AutoTokenizer
+class EmotionDataset(Dataset):
+    def __init__(self, rows: list[dict], tokenizer, max_len: int = 256) -> None:
+        self.rows = rows
+        self.tokenizer = tokenizer
+        self.max_len = max_len
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.dummy else "cpu")
-    logger.info("디바이스: %s", device)
+    def __len__(self) -> int:
+        return len(self.rows)
 
-    # 모델 소스 결정
-    model_source = args.previous_model_path or args.base_model_path
-    logger.info("모델 소스: %s", model_source)
+    def __getitem__(self, idx: int) -> dict:
+        row = self.rows[idx]
+        enc = self.tokenizer(
+            row["text"],
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        emotion_id = EMOTION2ID.get(row.get("emotion", "중립"), 1)
+        dialog_act_id = DIALOG_ACT2ID.get(row.get("dialog_act", "기타"), 14)
+        token_type_ids = enc.get(
+            "token_type_ids", torch.zeros(self.max_len, dtype=torch.long)
+        ).squeeze(0)
+        return {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "token_type_ids": token_type_ids,
+            "emotion_label": torch.tensor(emotion_id, dtype=torch.long),
+            "dialog_act_label": torch.tensor(dialog_act_id, dtype=torch.long),
+        }
 
-    write_status(status_file, {
-        "status": "running",
-        "job_id": args.job_id,
-        "current_epoch": 0,
-        "total_epochs": args.max_epochs if not args.dummy else 2,
-        "progress_pct": 0,
-    })
 
-    tokenizer = AutoTokenizer.from_pretrained(model_source)
-    backbone = AutoModel.from_pretrained(model_source).to(device)
-    hidden_size = backbone.config.hidden_size
+# ---------------------------------------------------------------------------
+# 모델
+# ---------------------------------------------------------------------------
 
-    emotion_head = nn.Linear(hidden_size, len(EMOTION_LABELS)).to(device)
-    dialog_act_head = nn.Linear(hidden_size, len(DIALOG_ACT_LABELS)).to(device)
+class EmotionClassifier(nn.Module):
+    def __init__(
+        self,
+        base_model_name_or_path: str,
+        num_emotions: int = 3,
+        num_dialog_acts: int = 15,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(base_model_name_or_path)
+        hidden = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(dropout)
+        self.emotion_head = nn.Linear(hidden, num_emotions)
+        self.dialog_act_head = nn.Linear(hidden, num_dialog_acts)
 
-    # 이전 버전 head 가중치 이어받기
-    if args.previous_model_path:
-        prev = Path(args.previous_model_path)
-        ep = prev / "emotion_head.pt"
-        dp = prev / "dialog_act_head.pt"
-        if ep.exists():
-            emotion_head.load_state_dict(torch.load(str(ep), map_location=device))
-            logger.info("이전 emotion_head 로드")
-        if dp.exists():
-            dialog_act_head.load_state_dict(torch.load(str(dp), map_location=device))
-            logger.info("이전 dialog_act_head 로드")
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        )
+        cls = self.dropout(out.last_hidden_state[:, 0])
+        return self.emotion_head(cls), self.dialog_act_head(cls)
 
-    # 데이터셋
-    if args.dummy:
-        DummyDataset = make_dummy_dataset()
-        train_ds = DummyDataset(tokenizer, n=10)
-        val_ds = DummyDataset(tokenizer, n=4)
-        max_epochs = 2
-        batch_size = 4
-    else:
-        data_dir = Path(args.data_dir)
-        train_ds = load_csv_dataset(tokenizer, data_dir / "train.csv", args.max_len)
-        val_ds = load_csv_dataset(tokenizer, data_dir / "val.csv", args.max_len)
-        max_epochs = args.max_epochs
-        batch_size = args.batch_size
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
+# ---------------------------------------------------------------------------
+# I/O 헬퍼
+# ---------------------------------------------------------------------------
 
-    optimizer = torch.optim.AdamW(
-        list(backbone.parameters()) + list(emotion_head.parameters()) + list(dialog_act_head.parameters()),
-        lr=args.lr,
+def load_csv(path: Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    logger.info("CSV 로드: %s (%d건)", path, len(rows))
+    return rows
+
+
+def _save_model(model: EmotionClassifier, tokenizer, output_dir: Path) -> None:
+    (output_dir / "encoder").mkdir(parents=True, exist_ok=True)
+    (output_dir / "tokenizer").mkdir(parents=True, exist_ok=True)
+    model.encoder.save_pretrained(str(output_dir / "encoder"))
+    tokenizer.save_pretrained(str(output_dir / "tokenizer"))
+    torch.save(
+        {
+            "emotion_head": model.emotion_head.state_dict(),
+            "dialog_act_head": model.dialog_act_head.state_dict(),
+        },
+        output_dir / "heads.pt",
     )
+    label_map = {"emotion_labels": EMOTION_LABELS, "dialog_act_labels": DIALOG_ACT_LABELS}
+    (output_dir / "label_map.json").write_text(
+        json.dumps(label_map, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info("모델 저장 완료: %s", output_dir)
+
+
+def _write_status(output_dir: Path, status: dict) -> None:
+    (output_dir / "training_status.json").write_text(
+        json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _update_current_symlink(models_root: Path, version_dir: Path) -> None:
+    current = models_root / "current"
+    try:
+        if current.is_symlink() or current.exists():
+            current.unlink()
+        current.symlink_to(version_dir.resolve())
+        logger.info("current 심링크 갱신: %s -> %s", current, version_dir)
+    except (OSError, NotImplementedError):
+        (models_root / "current.txt").write_text(
+            str(version_dir.resolve()), encoding="utf-8"
+        )
+        logger.info("current.txt 갱신: %s", version_dir)
+
+
+# ---------------------------------------------------------------------------
+# 평가
+# ---------------------------------------------------------------------------
+
+def _evaluate(model: EmotionClassifier, loader: DataLoader, device: torch.device) -> dict:
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    e_preds: list[int] = []
+    e_labels: list[int] = []
+    d_preds: list[int] = []
+    d_labels: list[int] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+            e_lbl = batch["emotion_label"].to(device)
+            d_lbl = batch["dialog_act_label"].to(device)
+
+            e_logit, d_logit = model(input_ids, attention_mask, token_type_ids)
+            loss = (
+                ALPHA_EMOTION * criterion(e_logit, e_lbl)
+                + ALPHA_DIALOG_ACT * criterion(d_logit, d_lbl)
+            )
+            total_loss += loss.item()
+            e_preds.extend(e_logit.argmax(dim=-1).cpu().tolist())
+            e_labels.extend(e_lbl.cpu().tolist())
+            d_preds.extend(d_logit.argmax(dim=-1).cpu().tolist())
+            d_labels.extend(d_lbl.cpu().tolist())
+
+    try:
+        from sklearn.metrics import f1_score
+        e_f1 = float(f1_score(e_labels, e_preds, average="macro", zero_division=0))
+        d_f1 = float(f1_score(d_labels, d_preds, average="macro", zero_division=0))
+    except ImportError:
+        n = max(len(e_labels), 1)
+        e_f1 = sum(p == lb for p, lb in zip(e_preds, e_labels)) / n
+        d_f1 = sum(p == lb for p, lb in zip(d_preds, d_labels)) / n
+
+    return {
+        "val_loss": total_loss / max(len(loader), 1),
+        "emotion_macro_f1": round(e_f1, 4),
+        "dialog_act_macro_f1": round(d_f1, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 학습
+# ---------------------------------------------------------------------------
+
+def train(args: argparse.Namespace) -> None:
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    version = datetime.now().strftime("v%Y%m%d_%H%M%S")
+    models_root = Path(args.output_dir)
+    output_dir = models_root / version
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("출력 디렉토리: %s", output_dir)
+
+    device = (
+        torch.device("cpu")
+        if args.cpu
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    logger.info("장치: %s", device)
+
+    if args.dummy:
+        logger.info("더미 모드: 소규모 CPU 테스트")
+        all_rows = make_dummy_rows(40)
+        split = int(len(all_rows) * 0.8)
+        train_rows, val_rows = all_rows[:split], all_rows[split:]
+        max_len = 32
+        batch_size = 4
+        max_epochs = 2
+    else:
+        train_rows = load_csv(Path(args.train_csv))
+        val_rows = load_csv(Path(args.val_csv))
+        max_len = args.max_len
+        batch_size = args.batch_size
+        max_epochs = args.max_epochs
+
+    if args.previous_model_path:
+        encoder_path = str(Path(args.previous_model_path) / "encoder")
+        tokenizer_path = str(Path(args.previous_model_path) / "tokenizer")
+        logger.info("증분 파인튜닝: %s", args.previous_model_path)
+    else:
+        encoder_path = args.base_model_path
+        tokenizer_path = args.base_model_path
+
+    logger.info("토크나이저 로드: %s", tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    logger.info("모델 로드: %s", encoder_path)
+    model = EmotionClassifier(encoder_path).to(device)
+
+    if args.previous_model_path:
+        heads_path = Path(args.previous_model_path) / "heads.pt"
+        if heads_path.exists():
+            ckpt = torch.load(str(heads_path), map_location="cpu")
+            model.emotion_head.load_state_dict(ckpt["emotion_head"])
+            model.dialog_act_head.load_state_dict(ckpt["dialog_act_head"])
+            logger.info("이전 head weights 로드 완료")
+
+    train_loader = DataLoader(
+        EmotionDataset(train_rows, tokenizer, max_len),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        EmotionDataset(val_rows, tokenizer, max_len),
+        batch_size=batch_size * 2,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    total_steps = len(train_loader) * max_epochs
+    warmup_steps = max(1, total_steps // 10)
+    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     criterion = nn.CrossEntropyLoss()
 
     best_val_loss = float("inf")
     no_improve_count = 0
-    patience = 3 if not args.dummy else 999
+    best_epoch = 0
+    epoch = 0
+    start_time = time.time()
+
+    status: dict = {
+        "version": version,
+        "status": "running",
+        "current_epoch": 0,
+        "max_epochs": max_epochs,
+        "best_val_loss": None,
+        "best_epoch": None,
+        "train_samples": len(train_rows),
+        "val_samples": len(val_rows),
+        "device": str(device),
+        "started_at": datetime.now().isoformat(),
+        "completed_at": None,
+    }
+    _write_status(output_dir, status)
 
     for epoch in range(1, max_epochs + 1):
-        backbone.train()
-        emotion_head.train()
-        dialog_act_head.train()
+        model.train()
+        epoch_loss = 0.0
+        t0 = time.time()
 
-        train_loss = 0.0
-        for batch in train_loader:
+        for step, batch in enumerate(train_loader, 1):
             input_ids = batch["input_ids"].to(device)
-            attn = batch["attention_mask"].to(device)
-            e_labels = batch["emotion_label"].to(device)
-            d_labels = batch["dialog_act_label"].to(device)
-
-            kwargs = {"input_ids": input_ids, "attention_mask": attn}
-            if "token_type_ids" in batch and batch["token_type_ids"] is not None:
-                kwargs["token_type_ids"] = batch["token_type_ids"].to(device)
-
-            outputs = backbone(**kwargs)
-            cls = outputs.last_hidden_state[:, 0, :]
-
-            e_loss = criterion(emotion_head(cls), e_labels)
-            d_loss = criterion(dialog_act_head(cls), d_labels)
-            loss = 0.7 * e_loss + 0.3 * d_loss
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+            e_lbl = batch["emotion_label"].to(device)
+            d_lbl = batch["dialog_act_label"].to(device)
 
             optimizer.zero_grad()
+            e_logit, d_logit = model(input_ids, attention_mask, token_type_ids)
+            loss = (
+                ALPHA_EMOTION * criterion(e_logit, e_lbl)
+                + ALPHA_DIALOG_ACT * criterion(d_logit, d_lbl)
+            )
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            train_loss += loss.item()
+            scheduler.step()
+            epoch_loss += loss.item()
 
-        # Validation
-        backbone.eval()
-        emotion_head.eval()
-        dialog_act_head.eval()
+            if step % max(1, len(train_loader) // 5) == 0:
+                logger.info(
+                    "Epoch %d/%d  Step %d/%d  loss=%.4f",
+                    epoch, max_epochs, step, len(train_loader), epoch_loss / step,
+                )
 
-        val_loss = 0.0
-        correct_e = 0
-        total = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch["input_ids"].to(device)
-                attn = batch["attention_mask"].to(device)
-                e_labels = batch["emotion_label"].to(device)
-                d_labels = batch["dialog_act_label"].to(device)
-
-                kwargs = {"input_ids": input_ids, "attention_mask": attn}
-                if "token_type_ids" in batch and batch["token_type_ids"] is not None:
-                    kwargs["token_type_ids"] = batch["token_type_ids"].to(device)
-
-                outputs = backbone(**kwargs)
-                cls = outputs.last_hidden_state[:, 0, :]
-
-                e_loss = criterion(emotion_head(cls), e_labels)
-                d_loss = criterion(dialog_act_head(cls), d_labels)
-                val_loss += (0.7 * e_loss + 0.3 * d_loss).item()
-
-                preds = emotion_head(cls).argmax(dim=-1)
-                correct_e += (preds == e_labels).sum().item()
-                total += e_labels.size(0)
-
-        avg_val_loss = val_loss / max(len(val_loader), 1)
-        emotion_acc = correct_e / max(total, 1)
-        progress_pct = round(epoch / max_epochs * 100, 1)
-
+        avg_train_loss = epoch_loss / max(len(train_loader), 1)
         logger.info(
-            "Epoch %d/%d — train_loss=%.4f val_loss=%.4f emotion_acc=%.4f",
-            epoch, max_epochs, train_loss / max(len(train_loader), 1), avg_val_loss, emotion_acc,
+            "Epoch %d 완료 -- train_loss=%.4f (%.1fs)",
+            epoch, avg_train_loss, time.time() - t0,
         )
 
-        write_status(status_file, {
-            "status": "running",
-            "job_id": args.job_id,
-            "current_epoch": epoch,
-            "total_epochs": max_epochs,
-            "val_loss": round(avg_val_loss, 6),
-            "val_emotion_acc": round(emotion_acc, 4),
-            "progress_pct": progress_pct,
-        })
+        val_metrics = _evaluate(model, val_loader, device)
+        val_loss = val_metrics["val_loss"]
+        logger.info(
+            "Epoch %d 검증 -- val_loss=%.4f  emotion_f1=%.4f  dialog_act_f1=%.4f",
+            epoch, val_loss, val_metrics["emotion_macro_f1"], val_metrics["dialog_act_macro_f1"],
+        )
 
-        # 조기 종료
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        status["current_epoch"] = epoch
+        status["last_val_loss"] = round(val_loss, 6)
+        status["last_emotion_f1"] = val_metrics["emotion_macro_f1"]
+        _write_status(output_dir, status)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
             no_improve_count = 0
+            _save_model(model, tokenizer, output_dir)
+            logger.info("Best 모델 저장 (val_loss=%.4f)", val_loss)
         else:
             no_improve_count += 1
-            if no_improve_count >= patience:
-                logger.info("조기 종료 (patience=%d)", patience)
+            logger.info("개선 없음 %d/%d", no_improve_count, EARLY_STOP_PATIENCE)
+            if no_improve_count >= EARLY_STOP_PATIENCE:
+                logger.info("조기 종료 (epoch %d)", epoch)
                 break
 
-    # 모델 저장
-    version = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_base = Path(args.output_base_dir)
-    save_dir = output_base / f"v{version}"
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    backbone.save_pretrained(str(save_dir))
-    tokenizer.save_pretrained(str(save_dir))
-    torch.save(emotion_head.state_dict(), str(save_dir / "emotion_head.pt"))
-    torch.save(dialog_act_head.state_dict(), str(save_dir / "dialog_act_head.pt"))
-
-    metrics = {
-        "best_val_loss": round(best_val_loss, 6),
-        "val_emotion_acc": round(emotion_acc, 4),
-        "total_epochs_run": epoch,
-        "model_version": f"v{version}",
-        "emotion_labels": EMOTION_LABELS,
-        "dialog_act_labels": DIALOG_ACT_LABELS,
-        "emotion_to_category": EMOTION_TO_CATEGORY,
-    }
-    (save_dir / "metrics.json").write_text(
-        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    final_metrics = _evaluate(model, val_loader, device)
+    final_metrics.update(
+        {
+            "best_epoch": best_epoch,
+            "best_val_loss": round(best_val_loss, 6),
+            "total_epochs_run": epoch,
+            "train_samples": len(train_rows),
+            "val_samples": len(val_rows),
+            "version": version,
+            "total_time_sec": round(time.time() - start_time, 1),
+        }
     )
+    (output_dir / "metrics.json").write_text(
+        json.dumps(final_metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info("최종 메트릭: %s", final_metrics)
 
-    # current 심링크 또는 current.txt 갱신
-    current_link = output_base / "current"
-    current_txt = output_base / "current.txt"
-    try:
-        if current_link.exists() or current_link.is_symlink():
-            current_link.unlink()
-        current_link.symlink_to(save_dir.resolve())
-        logger.info("symlink 갱신: current → %s", save_dir)
-    except (OSError, NotImplementedError):
-        # Windows 심링크 실패 시 current.txt fallback
-        current_txt.write_text(f"v{version}", encoding="utf-8")
-        logger.info("current.txt 갱신: v%s", version)
+    status["status"] = "completed"
+    status["best_val_loss"] = round(best_val_loss, 6)
+    status["best_epoch"] = best_epoch
+    status["completed_at"] = datetime.now().isoformat()
+    _write_status(output_dir, status)
 
-    logger.info("모델 저장 완료: %s", save_dir)
-    write_status(status_file, {
-        "status": "completed",
-        "job_id": args.job_id,
-        "model_version": f"v{version}",
-        "val_loss": round(best_val_loss, 6),
-        "val_emotion_acc": round(emotion_acc, 4),
-        "progress_pct": 100,
-    })
+    _update_current_symlink(models_root, output_dir)
+    logger.info("학습 완료 -- 버전: %s", version)
 
 
 # ---------------------------------------------------------------------------
@@ -347,35 +452,26 @@ def train(args, status_file: Optional[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="KcELECTRA 감정 모델 파인튜닝")
-    parser.add_argument("--base-model-path", default="snunlp/KR-ELECTRA-discriminator")
+    parser = argparse.ArgumentParser(description="KcELECTRA 감정+대화행위 멀티태스크 파인튜닝")
+    parser.add_argument("--dummy", action="store_true", help="CPU 소규모 테스트 모드")
+    parser.add_argument("--train-csv", default="data/emotion/train.csv")
+    parser.add_argument("--val-csv", default="data/emotion/val.csv")
+    parser.add_argument("--output-dir", default="models/emotion")
+    parser.add_argument("--base-model-path", default=DEFAULT_BASE_MODEL)
     parser.add_argument("--previous-model-path", default=None)
-    parser.add_argument("--data-dir", default="data/emotion")
-    parser.add_argument("--output-base-dir", default=None)
-    parser.add_argument("--job-id", default="manual")
-    parser.add_argument("--status-file", default=None)
-    parser.add_argument("--dummy", action="store_true")
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max-len", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
-    if args.output_base_dir is None:
-        args.output_base_dir = os.environ.get("EMOTION_MODEL_DIR", "models/emotion")
+    if not args.dummy and not Path(args.train_csv).exists():
+        logger.error("학습 CSV 없음: %s -- --dummy 또는 prepare_emotion_dataset.py 먼저 실행", args.train_csv)
+        raise SystemExit(1)
 
-    status_file = Path(args.status_file) if args.status_file else None
-
-    try:
-        train(args, status_file)
-    except Exception as exc:
-        logger.exception("학습 실패")
-        write_status(status_file, {
-            "status": "failed",
-            "job_id": args.job_id,
-            "error": str(exc),
-        })
-        sys.exit(1)
+    train(args)
 
 
 if __name__ == "__main__":
