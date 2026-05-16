@@ -120,7 +120,8 @@ async def pick_next_session() -> Optional[dict]:
 
 async def download_raw_audio(raw_audio_url: str) -> str:
     """Stream S3 object to a temp file on disk (never in RAM). Returns path — caller deletes."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    ext = raw_audio_url.rsplit(".", 1)[-1].lower() if "." in raw_audio_url else "wav"
+    tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
     try:
         await _run(lambda: _s3.download_fileobj(S3_AUDIO_BUCKET, raw_audio_url, tmp))
         tmp.flush()
@@ -141,9 +142,10 @@ async def submit_to_voice_api(audio_path: str) -> str:
         "denoise": "true",
     }
     url = f"{VOICE_API_URL}/api/v1/transcribe"
+    ext = audio_path.rsplit(".", 1)[-1].lower() if "." in audio_path else "wav"
     with open(audio_path, "rb") as f:
         form = aiohttp.FormData()
-        form.add_field("file", f, filename="audio.wav", content_type="audio/wav")
+        form.add_field("file", f, filename=f"raw.{ext}", content_type="application/octet-stream")
         async with _http.post(url, params=params, data=form) as resp:
             if resp.status == 503:
                 text = await resp.text()
@@ -279,8 +281,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     loop = asyncio.get_running_loop()
 
     upserted = 0
-    for utt in utterances:
-        seq: int = utt["index"]
+    for i, utt in enumerate(utterances):
+        seq: int = i + 1
         utt_id = f"utt_{session_id}_{str(seq).zfill(3)}"
         storage_path = f"utterances/{session_id}/{utt_id}.wav"
         audio_filename: str = utt.get("audio_filename", "")
@@ -322,7 +324,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "session_id": session_id,
             "chunk_id": None,
             "user_id": user_id,
-            "sequence_in_chunk": utt.get("sequence_in_chunk", seq),
+            "sequence_in_chunk": seq,
             "sequence_order": seq,
             "speaker_id": utt.get("speaker_id"),
             "is_user": False,
