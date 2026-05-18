@@ -384,6 +384,23 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "client_version": "gpu-worker-2.0",
             "quality_score": quality_score,
             "quality_grade": quality_grade,
+            # Stage 14: 자동 라벨
+            "emotion": utt.get("emotion"),
+            "emotion_confidence": utt.get("emotion_confidence"),
+            "dialog_act": utt.get("dialog_act"),
+            "dialog_act_confidence": utt.get("dialog_act_confidence"),
+            "auto_label_model_version": utt.get("auto_label_model_version"),
+            "label_source": utt.get("label_source"),
+            # Stage 15 Tier A: 통계 라벨
+            "speech_rate_wpm": utt.get("speech_rate_wpm"),
+            "silence_before_sec": utt.get("silence_before_sec"),
+            "filler_word_count": utt.get("filler_word_count"),
+            "confidence_tier": utt.get("confidence_tier"),
+            "audio_quality_class": utt.get("audio_quality_class"),
+            # Stage 16 Tier B: 언어적 특성 라벨
+            "honorific_level": utt.get("honorific_level"),
+            "question_type": utt.get("question_type"),
+            "language_mix_flag": utt.get("language_mix_flag"),
             "updated_at": _now_iso(),
         }
         await _run(
