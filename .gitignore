@@ -27,3 +27,4 @@ models/
 # 로컬 검증 산출물 (Phase 4~7 recluster offline/option-b 결과)
 .validation/
 .worktrees/
+data/

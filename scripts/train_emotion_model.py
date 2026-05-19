@@ -22,10 +22,15 @@ KcELECTRA 감정 + 대화행위 멀티태스크 파인튜닝
     encoder/            AutoModel.save_pretrained
     tokenizer/          AutoTokenizer.save_pretrained
     heads.pt            emotion_head + dialog_act_head state_dicts
-    label_map.json      EMOTION_LABELS, DIALOG_ACT_LABELS
+    label_map.json      EMOTION_LABELS, DIALOG_ACT_LABELS, DIALOG_ACT_GROUP_LABELS
+    model_card.json     heads, base_model, version 정보
     metrics.json        학습 완료 후 최종 지표
     training_status.json 실시간 진행 상황
   models/emotion/current  symlink (Linux) 또는 current.txt (Windows)
+
+추론 시 dialog_act_group:
+  dialog_act 예측 → DIALOG_ACT_TO_GROUP 매핑으로 6-class group 자동 파생
+  별도 head 없음 (label_map.json에 매핑 포함)
 """
 from __future__ import annotations
 
@@ -35,11 +40,13 @@ import json
 import logging
 import random
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
@@ -61,10 +68,72 @@ DIALOG_ACT_LABELS = [
 ]
 DIALOG_ACT2ID = {v: i for i, v in enumerate(DIALOG_ACT_LABELS)}
 
+# 15-class dialog_act → 6-class group (추론 시 자동 파생, 별도 head 없음)
+DIALOG_ACT_TO_GROUP: dict[str, str] = {
+    "진술": "정보",
+    "질문": "질문/확인",
+    "확인": "질문/확인",
+    "요청": "요청/제안",
+    "제안": "요청/제안",
+    "감사": "감사/사과",
+    "사과": "감사/사과",
+    "인사": "사회적",
+    "동의": "응답",
+    "반대": "응답",
+    "부정": "응답",
+    "응답": "응답",
+    "명령": "지시",
+    "감탄": "감정 표현",
+    "기타": "기타",
+}
+DIALOG_ACT_GROUP_LABELS = sorted(set(DIALOG_ACT_TO_GROUP.values()))
+
 DEFAULT_BASE_MODEL = "snunlp/KR-ELECTRA-discriminator"
 ALPHA_EMOTION = 0.7
 ALPHA_DIALOG_ACT = 0.3
 EARLY_STOP_PATIENCE = 3
+
+
+# ---------------------------------------------------------------------------
+# 데이터 전처리 유틸
+# ---------------------------------------------------------------------------
+
+def _undersample_kita(rows: list[dict], max_ratio: float = 0.5) -> list[dict]:
+    """dialog_act '기타' 비율을 max_ratio(기본 50%) 이하로 언더샘플.
+    '기타'가 편향되어 다른 15개 클래스 학습을 방해하는 것을 방지.
+    non_kita=0 이면 전체가 '기타' 뿐인 데이터셋 — 언더샘플 불필요, 원본 반환.
+    """
+    kita = [r for r in rows if r.get("dialog_act", "") == "기타"]
+    non_kita = [r for r in rows if r.get("dialog_act", "") != "기타"]
+    if not non_kita:
+        logger.info("dialog_act non_kita=0 — 전체 '기타' 데이터셋, 언더샘플 스킵 (%d행)", len(rows))
+        return rows
+    max_kita = int(len(non_kita) * max_ratio / max(1 - max_ratio, 1e-9))
+    if len(kita) > max_kita:
+        random.shuffle(kita)
+        kita = kita[:max_kita]
+        logger.info("dialog_act '기타' 언더샘플: %d → %d (non_kita=%d)",
+                    len([r for r in rows if r.get("dialog_act", "") == "기타"]),
+                    len(kita), len(non_kita))
+    result = non_kita + kita
+    random.shuffle(result)
+    return result
+
+
+def _compute_dialog_act_weights(rows: list[dict], device: torch.device) -> torch.Tensor:
+    """dialog_act 클래스별 역빈도 가중치 계산.
+    희소 클래스에 높은 가중치를 부여해 불균형 보정.
+    """
+    counts = Counter(r.get("dialog_act", "기타") for r in rows)
+    total = sum(counts.values())
+    n_classes = len(DIALOG_ACT_LABELS)
+    weights = torch.ones(n_classes)
+    for label, cnt in counts.items():
+        if label in DIALOG_ACT2ID and cnt > 0:
+            weights[DIALOG_ACT2ID[label]] = total / (n_classes * cnt)
+    logger.info("dialog_act 클래스 가중치: %s",
+                {DIALOG_ACT_LABELS[i]: round(weights[i].item(), 3) for i in range(n_classes)})
+    return weights.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -96,35 +165,36 @@ def make_dummy_rows(n: int = 40) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 class EmotionDataset(Dataset):
-    def __init__(self, rows: list[dict], tokenizer, max_len: int = 256) -> None:
+    def __init__(self, rows: list[dict]) -> None:
         self.rows = rows
-        self.tokenizer = tokenizer
-        self.max_len = max_len
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> dict:
         row = self.rows[idx]
-        enc = self.tokenizer(
-            row["text"],
-            max_length=self.max_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        emotion_id = EMOTION2ID.get(row.get("emotion", "중립"), 1)
-        dialog_act_id = DIALOG_ACT2ID.get(row.get("dialog_act", "기타"), 14)
-        token_type_ids = enc.get(
-            "token_type_ids", torch.zeros(self.max_len, dtype=torch.long)
-        ).squeeze(0)
         return {
-            "input_ids": enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "token_type_ids": token_type_ids,
-            "emotion_label": torch.tensor(emotion_id, dtype=torch.long),
-            "dialog_act_label": torch.tensor(dialog_act_id, dtype=torch.long),
+            "text": row["text"],
+            "emotion_label": EMOTION2ID.get(row.get("emotion", "중립"), 1),
+            "dialog_act_label": DIALOG_ACT2ID.get(row.get("dialog_act", "기타"), 14),
         }
+
+
+def _make_collate_fn(tokenizer, max_len: int):
+    def collate_fn(batch):
+        texts = [b["text"] for b in batch]
+        enc = tokenizer(texts, max_length=max_len, padding="max_length",
+                        truncation=True, return_tensors="pt")
+        n = len(texts)
+        tti = enc.get("token_type_ids", torch.zeros(n, max_len, dtype=torch.long))
+        return {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+            "token_type_ids": tti,
+            "emotion_label": torch.tensor([b["emotion_label"] for b in batch], dtype=torch.long),
+            "dialog_act_label": torch.tensor([b["dialog_act_label"] for b in batch], dtype=torch.long),
+        }
+    return collate_fn
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +244,8 @@ def load_csv(path: Path) -> list[dict]:
     return rows
 
 
-def _save_model(model: EmotionClassifier, tokenizer, output_dir: Path) -> None:
+def _save_model(model: EmotionClassifier, tokenizer, output_dir: Path, version: str,
+                base_model: str) -> None:
     (output_dir / "encoder").mkdir(parents=True, exist_ok=True)
     (output_dir / "tokenizer").mkdir(parents=True, exist_ok=True)
     model.encoder.save_pretrained(str(output_dir / "encoder"))
@@ -186,14 +257,31 @@ def _save_model(model: EmotionClassifier, tokenizer, output_dir: Path) -> None:
         },
         output_dir / "heads.pt",
     )
-    label_map = {"emotion_labels": EMOTION_LABELS, "dialog_act_labels": DIALOG_ACT_LABELS}
+    label_map = {
+        "emotion_labels": EMOTION_LABELS,
+        "dialog_act_labels": DIALOG_ACT_LABELS,
+        "dialog_act_group_labels": DIALOG_ACT_GROUP_LABELS,
+        "dialog_act_to_group": DIALOG_ACT_TO_GROUP,
+    }
     (output_dir / "label_map.json").write_text(
         json.dumps(label_map, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    model_card = {
+        "version": version,
+        "base_model": base_model,
+        "heads": ["emotion", "dialog_act", "dialog_act_group"],
+        "emotion_labels": EMOTION_LABELS,
+        "dialog_act_labels": DIALOG_ACT_LABELS,
+        "dialog_act_group_labels": DIALOG_ACT_GROUP_LABELS,
+        "note": "dialog_act_group is derived from dialog_act via DIALOG_ACT_TO_GROUP mapping, no separate head",
+    }
+    (output_dir / "model_card.json").write_text(
+        json.dumps(model_card, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     logger.info("모델 저장 완료: %s", output_dir)
 
 
-_external_status_file: Path | None = None  # set by main() when --status-file is passed
+_external_status_file: Path | None = None
 
 
 def _write_status(output_dir: Path, status: dict) -> None:
@@ -244,11 +332,12 @@ def _evaluate(model: EmotionClassifier, loader: DataLoader, device: torch.device
             e_lbl = batch["emotion_label"].to(device)
             d_lbl = batch["dialog_act_label"].to(device)
 
-            e_logit, d_logit = model(input_ids, attention_mask, token_type_ids)
-            loss = (
-                ALPHA_EMOTION * criterion(e_logit, e_lbl)
-                + ALPHA_DIALOG_ACT * criterion(d_logit, d_lbl)
-            )
+            with autocast("cuda", enabled=device.type == "cuda"):
+                e_logit, d_logit = model(input_ids, attention_mask, token_type_ids)
+                loss = (
+                    ALPHA_EMOTION * criterion(e_logit, e_lbl)
+                    + ALPHA_DIALOG_ACT * criterion(d_logit, d_lbl)
+                )
             total_loss += loss.item()
             e_preds.extend(e_logit.argmax(dim=-1).cpu().tolist())
             e_labels.extend(e_lbl.cpu().tolist())
@@ -291,6 +380,10 @@ def train(args: argparse.Namespace) -> None:
         else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
     logger.info("장치: %s", device)
+    # VRAM 85% 상한 — 나머지 15%는 Xwayland/OS 예약
+    if not args.cpu and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.85)
+
 
     if args.dummy:
         logger.info("더미 모드: 소규모 CPU 테스트")
@@ -306,6 +399,10 @@ def train(args: argparse.Namespace) -> None:
         max_len = args.max_len
         batch_size = args.batch_size
         max_epochs = args.max_epochs
+
+    # dialog_act '기타' 언더샘플 (학습 데이터만)
+    if not args.dummy:
+        train_rows = _undersample_kita(train_rows, max_ratio=0.5)
 
     if args.previous_model_path:
         encoder_path = str(Path(args.previous_model_path) / "encoder")
@@ -329,24 +426,37 @@ def train(args: argparse.Namespace) -> None:
             model.dialog_act_head.load_state_dict(ckpt["dialog_act_head"])
             logger.info("이전 head weights 로드 완료")
 
+    _collate = _make_collate_fn(tokenizer, max_len)
     train_loader = DataLoader(
-        EmotionDataset(train_rows, tokenizer, max_len),
+        EmotionDataset(train_rows),
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
+        collate_fn=_collate,
     )
     val_loader = DataLoader(
-        EmotionDataset(val_rows, tokenizer, max_len),
+        EmotionDataset(val_rows),
         batch_size=batch_size * 2,
         shuffle=False,
         num_workers=0,
+        collate_fn=_collate,
     )
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     total_steps = len(train_loader) * max_epochs
     warmup_steps = max(1, total_steps // 10)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    criterion = nn.CrossEntropyLoss()
+
+    # dialog_act는 불균형 클래스에 역빈도 가중치 적용; emotion은 prepare에서 이미 균형화
+    emotion_criterion = nn.CrossEntropyLoss()
+    if args.dummy:
+        dialog_act_criterion = nn.CrossEntropyLoss()
+    else:
+        da_weights = _compute_dialog_act_weights(train_rows, device)
+        dialog_act_criterion = nn.CrossEntropyLoss(weight=da_weights)
+
+    use_amp = (device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     best_val_loss = float("inf")
     no_improve_count = 0
@@ -382,22 +492,47 @@ def train(args: argparse.Namespace) -> None:
             d_lbl = batch["dialog_act_label"].to(device)
 
             optimizer.zero_grad()
-            e_logit, d_logit = model(input_ids, attention_mask, token_type_ids)
-            loss = (
-                ALPHA_EMOTION * criterion(e_logit, e_lbl)
-                + ALPHA_DIALOG_ACT * criterion(d_logit, d_lbl)
-            )
-            loss.backward()
+            with autocast("cuda", enabled=use_amp):
+                e_logit, d_logit = model(input_ids, attention_mask, token_type_ids)
+                loss = (
+                    ALPHA_EMOTION * emotion_criterion(e_logit, e_lbl)
+                    + ALPHA_DIALOG_ACT * dialog_act_criterion(d_logit, d_lbl)
+                )
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             epoch_loss += loss.item()
 
-            if step % max(1, len(train_loader) // 5) == 0:
+            if step % 500 == 0:
+                elapsed = time.time() - t0
+                steps_per_sec = step / max(elapsed, 1e-6)
                 logger.info(
-                    "Epoch %d/%d  Step %d/%d  loss=%.4f",
-                    epoch, max_epochs, step, len(train_loader), epoch_loss / step,
+                    "Epoch %d/%d  Step %d/%d  loss=%.4f  %.2f steps/s",
+                    epoch, max_epochs, step, len(train_loader), epoch_loss / step, steps_per_sec,
                 )
+
+            # 중간 체크포인트: 재부팅 보험 (최신 1개만 유지, 검증 없이 weights만 저장)
+            if args.save_steps > 0 and step % args.save_steps == 0:
+                ckpt_dir = output_dir / "checkpoint_latest"
+                ckpt_dir.mkdir(exist_ok=True)
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "step": step,
+                        "emotion_head": model.emotion_head.state_dict(),
+                        "dialog_act_head": model.dialog_act_head.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "epoch_loss_so_far": epoch_loss / step,
+                    },
+                    ckpt_dir / "ckpt.pt",
+                )
+                model.encoder.save_pretrained(str(ckpt_dir / "encoder"))
+                tokenizer.save_pretrained(str(ckpt_dir / "tokenizer"))
+                logger.info("중간 체크포인트 저장 (epoch=%d step=%d)", epoch, step)
 
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
         logger.info(
@@ -421,7 +556,7 @@ def train(args: argparse.Namespace) -> None:
             best_val_loss = val_loss
             best_epoch = epoch
             no_improve_count = 0
-            _save_model(model, tokenizer, output_dir)
+            _save_model(model, tokenizer, output_dir, version, encoder_path)
             logger.info("Best 모델 저장 (val_loss=%.4f)", val_loss)
         else:
             no_improve_count += 1
@@ -472,11 +607,13 @@ def main() -> None:
     parser.add_argument("--max-epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--max-len", type=int, default=256)
+    parser.add_argument("--max-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--job-id", default=None, help="라우터가 부여한 job ID (상태 추적용)")
-    parser.add_argument("--status-file", default=None, help="외부 상태 파일 경로 (라우터 폴링용)")
+    parser.add_argument("--save-steps", type=int, default=2000,
+                        help="N 스텝마다 중간 체크포인트 저장 (0=비활성화)")
+    parser.add_argument("--job-id", default=None)
+    parser.add_argument("--status-file", default=None)
     args = parser.parse_args()
 
     global _external_status_file
@@ -484,7 +621,7 @@ def main() -> None:
         _external_status_file = Path(args.status_file)
 
     if not args.dummy and not Path(args.train_csv).exists():
-        logger.error("학습 CSV 없음: %s -- --dummy 또는 prepare_emotion_dataset.py 먼저 실행", args.train_csv)
+        logger.error("학습 CSV 없음: %s", args.train_csv)
         raise SystemExit(1)
 
     train(args)

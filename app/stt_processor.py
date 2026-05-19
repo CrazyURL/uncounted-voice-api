@@ -815,6 +815,51 @@ def transcribe(
                 u["dialog_act_confidence"] = lbl.dialog_act_confidence
                 u["auto_label_model_version"] = lbl.model_version
 
+        # STAGE 15 — 화자 임베딩 추출 (WeSpeaker, graceful degradation)
+        speakers_result: list[dict] | None = None
+        if audio is not None and diarize_active and speaker_audio_result:
+            try:
+                global _speaker_embedding_model
+                if _speaker_embedding_model is None:
+                    from app.services.speaker_embedding import SpeakerEmbeddingModel
+                    _speaker_embedding_model = SpeakerEmbeddingModel()
+                from app.services.speaker_embedding import EmbeddingUnavailable
+                speakers_result = []
+                for entry in speaker_audio_result:
+                    sid = entry["speaker_id"]
+                    muted = mute_non_speaker(audio, segments, sid, config.SAMPLE_RATE)
+                    emb = _speaker_embedding_model.extract_embedding(muted, config.SAMPLE_RATE)
+                    emb_list = None if isinstance(emb, EmbeddingUnavailable) else emb.tolist()
+                    speakers_result.append({
+                        "speaker_label": sid,
+                        "embedding": emb_list,
+                    })
+                logger.info("[%s] 화자 임베딩 추출 %d명", task_id, len(speakers_result))
+            except Exception as e:
+                logger.warning("[%s] STAGE 15 화자 임베딩 실패 (graceful skip): %s", task_id, e)
+                speakers_result = None
+
+        # STAGE 16 — 세그먼트 주제 라벨 (30-class 고정 분류체계)
+        topic_segments_result: list[dict] | None = None
+        if utterances_result and len(utterances_result) >= 2:
+            try:
+                from app.services.topic_segmentation_service import segment_topics
+                seg_results = segment_topics(utterances_result)
+                topic_segments_result = [
+                    {
+                        "segment_index": s.segment_index,
+                        "topic": s.topic,
+                        "start_ms": s.start_ms,
+                        "end_ms": s.end_ms,
+                        "utterance_indices": s.utterance_indices,
+                    }
+                    for s in seg_results
+                ]
+                logger.info("[%s] 주제 세그먼트 %d개 탐지", task_id, len(topic_segments_result))
+            except Exception as e:
+                logger.warning("[%s] STAGE 16 세그먼트 탐지 실패 (graceful skip): %s", task_id, e)
+                topic_segments_result = None
+
         # 오디오 통계 계산
         file_size = file_path.stat().st_size if file_path.exists() else 0
         audio_stats = _compute_audio_stats(
@@ -854,6 +899,10 @@ def transcribe(
             output["utterances"] = utterances_result
         if speaker_audio_result is not None:
             output["speaker_audio"] = speaker_audio_result
+        if speakers_result is not None:
+            output["speakers"] = speakers_result
+        if topic_segments_result is not None:
+            output["topic_segments"] = topic_segments_result
         if audio_files:
             output["_audio_files"] = audio_files
         if use_chunked:
@@ -880,3 +929,4 @@ def transcribe(
                 os.unlink(chunk_file)
             except OSError:
                 pass
+
