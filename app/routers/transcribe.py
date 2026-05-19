@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import uuid
@@ -34,8 +35,15 @@ def _process_audio(
     denoise: bool | None = None,
     mask_audio_pii: bool = False,
     mask_audio_names: bool = False,
+    reference_embedding: str | None = None,
 ):
     """Background task: run WhisperX pipeline and update job store."""
+    ref_emb: list[float] | None = None
+    if reference_embedding:
+        try:
+            ref_emb = json.loads(reference_embedding)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("[%s] reference_embedding JSON 파싱 실패 — 무시", task_id)
     try:
         job_store.update_status(task_id, TaskStatus.processing)
         result = whisperx_service.transcribe(
@@ -49,6 +57,7 @@ def _process_audio(
             denoise_enabled=denoise,
             mask_audio_pii=mask_audio_pii,
             mask_audio_names=mask_audio_names,
+            reference_embedding=ref_emb,
         )
         audio_files = result.pop("_audio_files", None)
         if audio_files:
@@ -172,6 +181,12 @@ async def transcribe_audio(
         description="음성 내 이름 마스킹 활성화 여부. `mask_audio_pii=true`일 때만 유효하며, "
         "한국 성씨+이름 패턴을 탐지하여 비프음 처리합니다.",
     ),
+    reference_embedding: str | None = Query(
+        None,
+        description="발화자 voice profile 임베딩 (JSON float 배열). "
+        "uncounted-api가 voice_profiles에서 조회하여 전달. "
+        "diarize=true일 때만 유효하며, 전달 시 가장 유사한 화자를 self로 식별합니다.",
+    ),
 ):
     # 확장자 검증
     ext = FilePath(file.filename or "").suffix.lstrip(".").lower()
@@ -247,6 +262,7 @@ async def transcribe_audio(
         denoise,
         mask_audio_pii,
         mask_audio_names,
+        reference_embedding,
     )
 
     return {"task_id": task_id, "status": "pending"}

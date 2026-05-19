@@ -158,9 +158,10 @@ PII_PATTERNS = [
         lambda m: f"{m.group(1)}-****-{m.group(3)}",
         "전화번호",
     ),
-    # 전화번호 (붙여쓰기): 01012345678
+    # 전화번호 (붙여쓰기): 01012345678 / 0111234567 등 — 010~019 prefix 명시
+    # 011~019 는 구형 PCS 번호로 일부 사용자 잔존. 뒷자리 7~8자리 가능.
     (
-        re.compile(r"(010)(\d{4})(\d{4})"),
+        re.compile(r"(01[0-9])(\d{3,4})(\d{4})"),
         lambda m: f"{m.group(1)}****{m.group(3)}",
         "전화번호",
     ),
@@ -220,8 +221,40 @@ def _is_likely_name_with_context(
     return True
 
 
-def detect_pii_spans(text: str, enable_name_masking: bool = False) -> list[dict]:
-    """텍스트에서 PII의 위치(span)를 감지하고 리스트로 반환한다."""
+# ── 통화 등급 (049 v5 정합) ────────────────────────────────────────────
+# 'premium': 양측 개인. enable_name_masking은 호출자 옵션.
+# 'standard': 한쪽이 기업/가상번호 (직무 발화자 비식별화 의무, 약관 v1.2 제5조의2 3항).
+#             enable_name_masking을 호출자 값과 무관하게 True로 강제.
+# 'excluded': 거래 불가 통화 — 본 마스커는 호출되지 않으나, 호출 시 standard와 동일 처리.
+CallGrade = str  # Literal['premium', 'standard', 'excluded']
+
+
+def _resolve_name_masking(
+    enable_name_masking: bool, grade: Optional[CallGrade]
+) -> bool:
+    """STANDARD/EXCLUDED 등급은 enable_name_masking을 강제 True로 박는다.
+
+    약관 v1.2 제5조의2 3항: 직무 발화자 측 실명·소속·직책 등 식별 가능 단어의 강화 마스킹.
+    """
+    if grade in ("standard", "excluded"):
+        return True
+    return enable_name_masking
+
+
+def detect_pii_spans(
+    text: str,
+    enable_name_masking: bool = False,
+    grade: Optional[CallGrade] = None,
+) -> list[dict]:
+    """텍스트에서 PII의 위치(span)를 감지하고 리스트로 반환한다.
+
+    Args:
+        text: 입력 텍스트
+        enable_name_masking: 이름 마스킹 활성화 여부 (premium 기본 False)
+        grade: 통화 등급 ('premium' / 'standard' / 'excluded'). standard/excluded는
+               enable_name_masking을 자동 True로 강제.
+    """
+    enable_name_masking = _resolve_name_masking(enable_name_masking, grade)
     spans = []
 
     # 1. PII_PATTERNS 감지
@@ -253,8 +286,19 @@ def detect_pii_spans(text: str, enable_name_masking: bool = False) -> list[dict]
     return spans
 
 
-def mask_pii(text: str, enable_name_masking: bool = False) -> dict:
-    """텍스트에서 PII를 마스킹하고 결과를 반환한다."""
+def mask_pii(
+    text: str,
+    enable_name_masking: bool = False,
+    grade: Optional[CallGrade] = None,
+) -> dict:
+    """텍스트에서 PII를 마스킹하고 결과를 반환한다.
+
+    Args:
+        text: 입력 텍스트
+        enable_name_masking: 이름 마스킹 활성화 여부 (premium 기본 False)
+        grade: 통화 등급 (049 v5). standard/excluded는 enable_name_masking 자동 True.
+    """
+    enable_name_masking = _resolve_name_masking(enable_name_masking, grade)
     spans = detect_pii_spans(text, enable_name_masking)
 
     # 중첩된 span 처리: 시작 위치 순, 길이 역순으로 정렬
@@ -323,7 +367,9 @@ def mask_pii(text: str, enable_name_masking: bool = False) -> dict:
 
 
 def mask_segments(
-    segments: list[dict], enable_name_masking: bool = False
+    segments: list[dict],
+    enable_name_masking: bool = False,
+    grade: Optional[CallGrade] = None,
 ) -> list[dict]:
     """세그먼트 리스트의 텍스트를 마스킹한다.
 
@@ -331,7 +377,13 @@ def mask_segments(
     유형별 단일 항목으로 반환한다 (응답 스키마 PIIDetectedItem 계약).
     이전에는 list.extend()로 중복 dict 항목이 누적되어 응답에서
     유형이 중복되거나 일부 클라이언트에서 처리 시 마지막 값만 보였음.
+
+    Args:
+        segments: 세그먼트 리스트
+        enable_name_masking: 이름 마스킹 활성화 여부 (premium 기본 False)
+        grade: 통화 등급 (049 v5). standard/excluded는 enable_name_masking 자동 True.
     """
+    enable_name_masking = _resolve_name_masking(enable_name_masking, grade)
     type_count_map: dict[str, int] = {}
     for seg in segments:
         result = mask_pii(seg.get("text", ""), enable_name_masking)

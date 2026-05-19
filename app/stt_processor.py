@@ -579,6 +579,7 @@ def transcribe(
     denoise_enabled: bool | None = None,
     mask_audio_pii: bool = False,
     mask_audio_names: bool = False,
+    reference_embedding: list[float] | None = None,
 ) -> dict:
     """음성 파일을 STT 처리하고 마스킹된 결과를 반환한다.
 
@@ -605,6 +606,8 @@ def transcribe(
         chunked_utterances: list[dict] = []
         chunked_audio_files: dict[str, bytes] = {}
         pii_audio_ranges: list[tuple[float, float, str]] = []
+        pre_mask_texts_by_speaker: dict[str, list[str]] = {}
+        speakers_result: list[dict] | None = None
 
         if use_chunked:
             # ── 청크 모드: 대용량 오디오 ──
@@ -684,6 +687,13 @@ def transcribe(
                 if pii_audio_ranges:
                     audio = mask_audio_ranges(audio, pii_audio_ranges, config.SAMPLE_RATE)
                     logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간)", task_id, len(pii_audio_ranges))
+
+        # STAGE 15: PII 마스킹 전 화자별 텍스트 스냅샷 (호칭어 기반 관계 탐지용)
+        # mask_segments()가 segments 텍스트를 in-place 치환하므로 그 전에 수집해야 한다.
+        if enable_diarize and diarize_active:
+            for seg in segments:
+                spk = seg.get("speaker") or "SPEAKER_00"
+                pre_mask_texts_by_speaker.setdefault(spk, []).append(seg.get("text", ""))
 
         # 5. PII 마스킹 (텍스트)
         pii_summary = mask_segments(segments, enable_name_masking) if mask_pii else []
@@ -803,6 +813,36 @@ def transcribe(
             speaker_audio=speaker_audio_result,
         )
 
+        # STAGE 15: 화자 자동 식별 + 속성 분석
+        if enable_diarize and diarize_active and not use_chunked:
+            try:
+                from app.services.speaker_analysis_service import analyze_speakers
+
+                speaker_results = analyze_speakers(
+                    audio=audio,
+                    sample_rate=config.SAMPLE_RATE,
+                    segments=segments,
+                    pre_mask_texts_by_speaker=pre_mask_texts_by_speaker,
+                    reference_embedding=reference_embedding,
+                    embedding_model=_speaker_embedding_model,
+                )
+                speakers_result = [
+                    {
+                        "speaker_label": r.speaker_label,
+                        "speaker_role": r.speaker_role,
+                        "speaker_role_source": r.speaker_role_source,
+                        "speaker_gender": r.speaker_gender,
+                        "speaker_voice_age_range": r.speaker_voice_age_range,
+                        "speaker_speech_age_range": r.speaker_speech_age_range,
+                        "speaker_speech_age_model_version": r.speaker_speech_age_model_version,
+                        "speaker_relation": r.speaker_relation,
+                    }
+                    for r in speaker_results.values()
+                ]
+                logger.info("[%s] 화자 분석 완료 (%d명)", task_id, len(speakers_result))
+            except Exception as spk_err:
+                logger.warning("[%s] 화자 분석 실패 (graceful degradation): %s", task_id, spk_err)
+
         # 자동 감정/대화행위 라벨링 (모델 없을 때 graceful degradation)
         from app.services.auto_label_service import auto_label_service
         if utterances_result and auto_label_service.is_available():
@@ -814,6 +854,27 @@ def transcribe(
                 u["dialog_act"] = lbl.dialog_act
                 u["dialog_act_confidence"] = lbl.dialog_act_confidence
                 u["auto_label_model_version"] = lbl.model_version
+
+        # STAGE 16: 주제 세그먼트 탐지 (발화가 3개 이상일 때만 의미 있음)
+        topic_segments_result: list[dict] | None = None
+        if utterances_result and len(utterances_result) >= 3:
+            try:
+                from app.services.topic_segmentation_service import segment_topics
+
+                topic_segs = segment_topics(utterances_result)
+                topic_segments_result = [
+                    {
+                        "segment_index": s.segment_index,
+                        "topic": s.topic,
+                        "start_ms": s.start_ms,
+                        "end_ms": s.end_ms,
+                        "utterance_indices": s.utterance_indices,
+                    }
+                    for s in topic_segs
+                ]
+                logger.info("[%s] 주제 세그먼트 %d개 생성", task_id, len(topic_segments_result))
+            except Exception as topic_err:
+                logger.warning("[%s] 주제 세그먼트 분석 실패 (graceful degradation): %s", task_id, topic_err)
 
         # 오디오 통계 계산
         file_size = file_path.stat().st_size if file_path.exists() else 0
@@ -850,10 +911,16 @@ def transcribe(
             "audio_stats": audio_stats,
         }
 
+        output["schema_version"] = 2
+
         if utterances_result is not None:
             output["utterances"] = utterances_result
         if speaker_audio_result is not None:
             output["speaker_audio"] = speaker_audio_result
+        if speakers_result is not None:
+            output["speakers"] = speakers_result
+        if topic_segments_result is not None:
+            output["topic_segments"] = topic_segments_result
         if audio_files:
             output["_audio_files"] = audio_files
         if use_chunked:

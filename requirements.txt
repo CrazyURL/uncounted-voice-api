@@ -1,3 +1,5 @@
+boto3>=1.26.0
+supabase>=2.0.0
 aiofiles==25.1.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
@@ -104,8 +106,12 @@ regex==2026.4.4
 requests==2.33.1
 rich==14.3.3
 safetensors==0.7.0
+accelerate>=0.28
+datasets>=2.18
 scikit-learn==1.8.0
+sentencepiece>=0.2.0
 scipy==1.17.1
+librosa>=0.10.0
 setuptools==70.2.0
 six==1.17.0
 sortedcontainers==2.4.0
