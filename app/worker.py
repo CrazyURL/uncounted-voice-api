@@ -1,7 +1,7 @@
 """
 GPU Worker — Python port of gpu-worker.ts
-Polls Supabase for pending audio sessions and processes them via voice_api.
-Run as a standalone process on the GPU server alongside uncounted-voice_api.
+Polls Supabase for pending audio sessions and processes them via the voice API.
+Run as a standalone process on the GPU server alongside uncounted-voice-api.
 """
 
 import asyncio
