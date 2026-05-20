@@ -104,6 +104,32 @@ def test_detect_batch_empty_text_yields_no_candidates(client):
 
 
 @pytest.mark.unit
+def test_detect_batch_spoken_phone_auto_confirmed(client):
+    """한글 숫자어 전화번호도 candidate 경로에서 잡혀 auto_confirmed."""
+    resp = client.post(
+        "/api/v1/pii/detect-batch",
+        json={"items": [{"utterance_id": "sp1", "text": "번호 공일공 일이삼사 오육칠팔 이에요"}]},
+    )
+    assert resp.status_code == 200
+    cands = resp.json()["results"][0]["candidates"]
+    phones = [c for c in cands if c["type"] == "전화번호"]
+    assert len(phones) == 1
+    assert phones[0]["confidence_tier"] == "auto_confirmed"
+
+
+@pytest.mark.unit
+def test_detect_batch_spoken_phone_no_raw_text(client):
+    """음성 전화번호 후보도 원문(한글 숫자어 run) 을 응답에 노출하지 않는다."""
+    spoken = "공일공 일이삼사 오육칠팔"
+    resp = client.post(
+        "/api/v1/pii/detect-batch",
+        json={"items": [{"utterance_id": "sp2", "text": f"번호 {spoken} 이에요"}]},
+    )
+    assert resp.status_code == 200
+    assert spoken not in resp.text
+
+
+@pytest.mark.unit
 def test_detect_batch_multiple_items(client):
     resp = client.post(
         "/api/v1/pii/detect-batch",

@@ -68,15 +68,28 @@ def classify_tier(
     return "needs_human_decision"
 
 
-def _score_one(pii_type: str) -> dict:
-    high_precision = pii_type in HIGH_PRECISION_TYPES
-    ambiguous = pii_type in AMBIGUOUS_TYPES
-    if high_precision:
-        confidence = _CONFIDENCE_HIGH_PRECISION
-    elif ambiguous:
-        confidence = _CONFIDENCE_AMBIGUOUS
-    else:
-        confidence = _CONFIDENCE_WEAK
+def _score_one(span: dict) -> dict:
+    """span 의 type 기본값을 쓰되, span 이 per-span hint 를 주면 그것을 우선한다.
+
+    hint(있을 때만): confidence / high_precision_pattern / type_ambiguous.
+    음성 전사형 등 같은 type 안에서도 정밀도가 다른 후보를 보수적으로 분류하기 위함.
+    hint 가 없는 기존 패턴은 종전과 동일하게 type 기반으로 합성된다(하위호환).
+    """
+    pii_type = span["type"]
+    high_precision = span.get("high_precision_pattern")
+    if high_precision is None:
+        high_precision = pii_type in HIGH_PRECISION_TYPES
+    ambiguous = span.get("type_ambiguous")
+    if ambiguous is None:
+        ambiguous = pii_type in AMBIGUOUS_TYPES
+    confidence = span.get("confidence")
+    if confidence is None:
+        if high_precision:
+            confidence = _CONFIDENCE_HIGH_PRECISION
+        elif ambiguous:
+            confidence = _CONFIDENCE_AMBIGUOUS
+        else:
+            confidence = _CONFIDENCE_WEAK
     return {
         "confidence": confidence,
         "high_precision_pattern": high_precision,
@@ -91,7 +104,7 @@ def score_candidates(spans: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for span in spans:
-        scored = _score_one(span["type"])
+        scored = _score_one(span)
         candidate = {
             "type": span["type"],
             "char_start": span["char_start"],

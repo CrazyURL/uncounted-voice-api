@@ -31,6 +31,9 @@ class DetectBatchRequest(BaseModel):
     items: list[DetectBatchItem] = Field(default_factory=list)
     # PII 검수는 이름 후보도 사람 판단 큐로 보내야 하므로 기본 True.
     enable_name_masking: bool = True
+    # 음성 전사형 PII(한글 숫자어 전화번호 등) 후보화 — candidate 경로 기본 True.
+    # 마스킹 경로(mask_pii)는 이 라우트를 쓰지 않으므로 영향 없음.
+    include_spoken_pii: bool = True
 
 
 class PiiCandidateOut(BaseModel):
@@ -56,7 +59,11 @@ def detect_batch(req: DetectBatchRequest) -> DetectBatchResponse:
     """발화 텍스트 배치를 받아 PII 후보(원문 미포함)를 반환한다."""
     results: list[DetectBatchResultItem] = []
     for item in req.items:
-        spans = detect_pii_spans(item.text, enable_name_masking=req.enable_name_masking)
+        spans = detect_pii_spans(
+            item.text,
+            enable_name_masking=req.enable_name_masking,
+            include_spoken_pii=req.include_spoken_pii,
+        )
         scored = score_candidates(spans)  # matched_text 제거됨
         results.append(
             DetectBatchResultItem(
