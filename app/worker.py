@@ -30,7 +30,7 @@ STUCK_THRESHOLD_SEC = 600           # 10 min
 RETRY_DELAY_SEC = 1800              # 30 min between retries
 MAX_RETRY_COUNT = 3
 VOICE_API_POLL_INTERVAL_SEC = 1
-VOICE_API_MAX_WAIT_SEC = 300        # 5 min
+VOICE_API_MAX_WAIT_SEC = 600        # 10 min — long sessions exceed 300s STT
 
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "2"))
 VOICE_API_URL = os.getenv("VOICE_API_URL", "http://localhost:8001")
