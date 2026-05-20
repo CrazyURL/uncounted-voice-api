@@ -1,13 +1,14 @@
 """
 GPU Worker — Python port of gpu-worker.ts
-Polls Supabase for pending audio sessions and processes them via the voice API.
-Run as a standalone process on the GPU server alongside uncounted-voice-api.
+Polls Supabase for pending audio sessions and processes them via voice_api.
+Run as a standalone process on the GPU server alongside uncounted-voice_api.
 """
 
 import asyncio
 import functools
 import logging
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -16,7 +17,6 @@ from typing import Optional
 
 import aiohttp
 import boto3
-from botocore.config import Config
 from supabase import create_client, Client
 
 # TODO(post-seed): worker_heartbeats 테이블 + 어드민 5분 무응답 알람
@@ -269,7 +269,8 @@ def _get_audio_stats_sync(wav_path: str) -> dict:
 
 
 def _compute_quality(rms_db: float, peak_db: float, silence_ratio: float) -> tuple:
-    """Port of qualityMetricsService.ts computeQualityScore. Returns (score, grade, snr_db, speech_ratio)."""
+    """Port of qualityMetricsService.ts computeQualityScore.
+    Returns (score, grade, snr_db, speech_ratio, clipping_ratio)."""
     snr_db = abs(peak_db - rms_db)
     speech_ratio = max(0.0, 1.0 - silence_ratio)
     clipping_ratio = min(1.0, (peak_db + 1) / 1.0) if peak_db > -1 else 0.0
@@ -280,7 +281,170 @@ def _compute_quality(rms_db: float, peak_db: float, silence_ratio: float) -> tup
         snr_score * 0.4 + speech_score * 0.4 + 20 - clipping_penalty
     )))
     grade = "A" if score >= 80 else "B" if score >= 50 else "C"
-    return score, grade, snr_db, speech_ratio
+    return score, grade, snr_db, speech_ratio, clipping_ratio
+
+
+# ── Numeric pattern extractor — port of lib/extractors/numeric-patterns.ts ──
+# 안전선 #3/#4: surface/normalized 원문 미저장. masked 토큰만 반환.
+# re.ASCII 로 컴파일 → JS(\b 가 ASCII word boundary)와 동일한 경계 동작.
+_NUMERIC_PATTERN_RULES = [
+    ("phone_number",
+     re.compile(r"\b(?:0(?:2|[3-6][1-5]|7[0-9]|8[0-9])[-\s]?\d{3,4}[-\s]?\d{4}|01[016-9][-\s]?\d{3,4}[-\s]?\d{4})\b", re.ASCII),
+     True, "[PHONE]"),
+    ("account_number",
+     re.compile(r"\b\d{3,6}-\d{2,6}-\d{2,7}\b|\b\d{10,14}\b", re.ASCII),
+     True, "[ACCOUNT]"),
+    ("birth_date",
+     re.compile(r"\b(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\b", re.ASCII),
+     True, "[BIRTHDATE]"),
+    ("birth_date",
+     re.compile(r"\b(?:19|20)\d{2}년\s?(?:0?[1-9]|1[0-2])월\s?(?:0?[1-9]|[12]\d|3[01])일", re.ASCII),
+     True, "[BIRTHDATE]"),
+    ("date",
+     re.compile(r"\b(?:(?:19|20)\d{2}[-./](?:0?[1-9]|1[0-2])[-./](?:0?[1-9]|[12]\d|3[01])|(?:0?[1-9]|1[0-2])월\s?(?:0?[1-9]|[12]\d|3[01])일)\b", re.ASCII),
+     False, "[DATE]"),
+    ("time",
+     re.compile(r"(?:\b(?:[01]?\d|2[0-3]):[0-5]\d\b|(?:오전|오후)\s?\d{1,2}시(?:\s?\d{1,2}분)?|\b\d{1,2}시\s?\d{1,2}분)", re.ASCII),
+     False, "[TIME]"),
+    ("amount",
+     re.compile(r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\s?(?:원|만\s?원|억\s?원|만|억|달러|불|USD|KRW)", re.ASCII),
+     False, "[AMOUNT]"),
+    ("zipcode",
+     re.compile(r"\b\d{5}\b(?=\s?(?:번지|호|동|로|길|아파트|우편번호))", re.ASCII),
+     True, "[ZIPCODE]"),
+    ("age",
+     re.compile(r"\b\d{1,2}\s?(?:세|살|대)\b", re.ASCII),
+     True, "[AGE]"),
+    ("statistics",
+     re.compile(r"\b\d{1,3}(?:\.\d+)?\s?(?:%|퍼센트|점)", re.ASCII),
+     False, "[PERCENT]"),
+]
+
+
+def extract_numeric_patterns(text) -> list[dict]:
+    """transcript 의 숫자 PII 패턴을 masked 토큰으로 추출. 겹침 시 앞 규칙/긴 매치 우선."""
+    if not isinstance(text, str) or len(text) == 0:
+        return []
+    collected = []
+    for priority, (ptype, regex, pii_related, masked) in enumerate(_NUMERIC_PATTERN_RULES):
+        for m in regex.finditer(text):
+            collected.append({
+                "priority": priority,
+                "start": m.start(),
+                "end": m.end(),
+                "type": ptype,
+                "masked": masked,
+                "pii_related": pii_related,
+            })
+    if not collected:
+        return []
+    # start 오름차순 → priority 오름차순 → 길이 내림차순
+    collected.sort(key=lambda r: (r["start"], r["priority"], -(r["end"] - r["start"])))
+    output: list[dict] = []
+    last_end = -1
+    for m in collected:
+        if m["start"] >= last_end:
+            output.append({
+                "type": m["type"],
+                "surface_masked": m["masked"],
+                "normalized_masked": m["masked"],
+                "pii_related": m["pii_related"],
+            })
+            last_end = m["end"]
+    return output
+
+
+# ── Utterance form extractor — port of lib/extractors/utterance-form.ts ──
+_BACKCHANNEL_TOKENS = {
+    "응", "어", "네", "예", "엉", "음", "아", "오",
+    "그래", "그렇지", "그렇구나", "그렇군", "그치", "맞아",
+    "아하", "어어", "응응", "네네", "예예",
+}
+_GREETING_PATTERNS = [
+    re.compile(r"안녕하?세요"),
+    re.compile(r"\b안녕\b", re.ASCII),
+    re.compile(r"여보세요"),
+    re.compile(r"반갑(?:습니다|네요|다)"),
+    re.compile(r"만나서\s?반갑"),
+    re.compile(r"처음\s?뵙겠"),
+    re.compile(r"\bhello\b", re.ASCII | re.IGNORECASE),
+    re.compile(r"\bhi\b", re.ASCII | re.IGNORECASE),
+    re.compile(r"\bhey\b", re.ASCII | re.IGNORECASE),
+]
+_CLOSING_PATTERNS = [
+    re.compile(r"끊을게요?"),
+    re.compile(r"끊어요?"),
+    re.compile(r"들어가(?:세요|볼게요|시죠)"),
+    re.compile(r"다음에\s?(?:봬요|만나|뵈요)"),
+    re.compile(r"안녕히\s?(?:가|계)"),
+    re.compile(r"종료(?:합니다|할게요)"),
+    re.compile(r"수고\s?(?:하세요|하셨습니다|했어요)"),
+    re.compile(r"그럼\s?이만"),
+]
+_QUESTION_PATTERNS = [
+    re.compile(r"\?\s*$"),
+    re.compile(r"(?:까요|나요|니까|세요|드릴까요)\s*[?.]?\s*$"),
+    re.compile(r"^(?:왜|어떻게|언제|어디|누가|뭐|무엇|얼마|몇)"),
+]
+_EXCLAMATION_PATTERNS = [
+    re.compile(r"!+\s*$"),
+    re.compile(r"(?:헐|와|어머|세상에|진짜|대박|아이고)"),
+]
+
+
+def _infer_turn_type(order, total, is_greeting: bool, is_closing: bool) -> str:
+    if isinstance(order, int) and isinstance(total, int) and total > 0:
+        if order <= 1:
+            return "opening"
+        if order >= total - 2:
+            return "closing"
+        return "mid"
+    if is_greeting:
+        return "opening"
+    if is_closing:
+        return "closing"
+    return "unknown"
+
+
+def extract_utterance_form(text, sequence_order=None, total_utterances=None) -> dict:
+    """발화 유형/턴/맞장구 추출 (heuristic_mvp). sequence_order 는 0-based."""
+    empty = {
+        "utterance_type": "unknown",
+        "turn_type": "unknown",
+        "is_short_response": False,
+        "is_backchannel": False,
+        "is_greeting": False,
+        "is_closing": False,
+    }
+    if not isinstance(text, str) or not text.strip():
+        return empty
+
+    trimmed = text.strip()
+    stripped = re.sub(r"\s+", "", trimmed)
+    word_count = len([w for w in re.split(r"\s+", trimmed) if w])
+
+    is_short_response = 0 < len(stripped) < 4
+    is_backchannel = is_short_response and stripped in _BACKCHANNEL_TOKENS
+    is_greeting = any(p.search(trimmed) for p in _GREETING_PATTERNS)
+    is_closing = any(p.search(trimmed) for p in _CLOSING_PATTERNS)
+
+    if any(p.search(trimmed) for p in _QUESTION_PATTERNS):
+        utterance_type = "question"
+    elif any(p.search(trimmed) for p in _EXCLAMATION_PATTERNS):
+        utterance_type = "exclamation"
+    elif word_count > 0:
+        utterance_type = "statement"
+    else:
+        utterance_type = "unknown"
+
+    return {
+        "utterance_type": utterance_type,
+        "turn_type": _infer_turn_type(sequence_order, total_utterances, is_greeting, is_closing),
+        "is_short_response": is_short_response,
+        "is_backchannel": is_backchannel,
+        "is_greeting": is_greeting,
+        "is_closing": is_closing,
+    }
 
 
 # ── Persist results ───────────────────────────────────────────────────
@@ -336,6 +500,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
         quality_grade = None
         snr_db = None
         speech_ratio = None
+        clipping_ratio = None
         file_size_bytes = None
         tmp_path = None
 
@@ -347,7 +512,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             file_size_bytes = os.path.getsize(tmp_path)
 
             stats = await loop.run_in_executor(None, _get_audio_stats_sync, tmp_path)
-            quality_score, quality_grade, snr_db, speech_ratio = _compute_quality(
+            quality_score, quality_grade, snr_db, speech_ratio, clipping_ratio = _compute_quality(
                 stats["rms_db"], stats["peak_db"], stats["silence_ratio"]
             )
 
@@ -379,6 +544,11 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
                         "piiType": pii_item["type"],
                     })
 
+        transcript = utt.get("transcript_text", "")
+        numeric_patterns = extract_numeric_patterns(transcript)
+        utterance_form = extract_utterance_form(
+            transcript, sequence_order=i, total_utterances=len(utterances)
+        )
         speaker_label: str | None = utt.get("speaker_id")
         row = {
             "id": utt_id,
@@ -396,7 +566,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "storage_path": storage_path,
             "file_size_bytes": file_size_bytes,
             "upload_status": "uploaded",
-            "transcript_text": utt.get("transcript_text", ""),
+            "transcript_text": transcript,
             "transcript_words": utt.get("words"),
             "segmented_by": "gpu_v10",
             "client_version": "gpu-worker-2.0",
@@ -404,6 +574,9 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "quality_grade": quality_grade,
             "snr_db": snr_db,
             "speech_ratio": speech_ratio,
+            "clipping_ratio": clipping_ratio,
+            "numeric_patterns": numeric_patterns,
+            "utterance_form": utterance_form,
             "pii_intervals": pii_intervals,
             # Stage 14: 자동 라벨
             "emotion": utt.get("emotion"),
@@ -780,11 +953,6 @@ async def main() -> None:
         endpoint_url=S3_ENDPOINT_URL,
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        config=Config(
-            signature_version="s3v4",
-            request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
-        ),
     )
     _http = aiohttp.ClientSession()
 
