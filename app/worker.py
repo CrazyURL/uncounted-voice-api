@@ -16,6 +16,7 @@ from typing import Optional
 
 import aiohttp
 import boto3
+from botocore.config import Config
 from supabase import create_client, Client
 
 # TODO(post-seed): worker_heartbeats 테이블 + 어드민 5분 무응답 알람
@@ -779,6 +780,11 @@ async def main() -> None:
         endpoint_url=S3_ENDPOINT_URL,
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        config=Config(
+            signature_version="s3v4",
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
     )
     _http = aiohttp.ClientSession()
 
