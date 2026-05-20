@@ -180,6 +180,95 @@ PII_PATTERNS = [
 ]
 
 
+# ── 음성 전사형 PII (STT 한글 숫자어) — PII-1A Category 1 ─────────────────
+# 한국어 통화 STT 는 전화번호를 "공일공 일이삼사 오육칠팔" 처럼 한글 숫자어로 전사한다.
+# 위 \d 정규식은 이를 못 잡으므로 별도 패스로 탐지한다. 이 패스는 detect_pii_spans 에
+# include_spoken_pii=True 일 때만 동작하며, 텍스트/오디오 마스킹 경로(mask_pii 등)는
+# 기본값 False 로 호출하므로 영향받지 않는다 (마스킹 freeze).
+_SINO_DIGIT = {
+    "공": "0", "영": "0", "일": "1", "이": "2", "삼": "3",
+    "사": "4", "오": "5", "육": "6", "칠": "7", "팔": "8", "구": "9",
+}
+_NATIVE_DIGIT = {
+    "하나": "1", "둘": "2", "셋": "3", "넷": "4", "다섯": "5",
+    "여섯": "6", "일곱": "7", "여덟": "8", "아홉": "9",
+}
+# 토큰화 우선순위: 2글자 native 를 1글자 sino 보다 먼저 (regex 교체는 순서 우선).
+_DIGIT_WORD_ALT = (
+    "다섯|여섯|일곱|여덟|아홉|하나|둘|셋|넷|"
+    "공|영|일|이|삼|사|오|육|칠|팔|구"
+)
+_DIGIT_WORD = re.compile(_DIGIT_WORD_ALT)
+# 휴대폰 정규화 기준: 01X + 10~11자리. 0(공/영) 으로 시작해야만 매칭.
+_SPOKEN_MOBILE_RE = re.compile(r"^01[0-9]\d{7,8}$")
+# 휴대폰 자릿수 = 단어 수(각 단어=1자리). 긴 창(11)을 먼저 시도.
+_SPOKEN_PHONE_WINDOWS = (11, 10)
+
+
+def _spoken_word_to_digit(word: str) -> str:
+    """한글 숫자어 1단어 → 숫자 1자리."""
+    return _NATIVE_DIGIT.get(word) or _SINO_DIGIT[word]
+
+
+def _spoken_digit_runs(text: str) -> list[list[re.Match]]:
+    """텍스트의 숫자어 토큰을 공백으로만 이어진 maximal run 으로 묶는다."""
+    runs: list[list[re.Match]] = []
+    cur: list[re.Match] = []
+    prev_end = -1
+    for m in _DIGIT_WORD.finditer(text):
+        # 직전 토큰과의 사이가 공백뿐일 때만 같은 run (조사·어미 등이 끼면 분리).
+        if cur and text[prev_end:m.start()].strip() == "":
+            cur.append(m)
+        else:
+            if cur:
+                runs.append(cur)
+            cur = [m]
+        prev_end = m.end()
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def detect_spoken_phone_spans(text: str) -> list[dict]:
+    """한글 숫자어로 전사된 휴대폰 번호를 탐지한다 (offset 보존).
+
+    discriminator (오탐 방지):
+      - 숫자어가 공백으로만 이어진 run 안에서 10~11단어 창을 슬라이드
+      - 창의 정규화 결과가 01X + 10~11자리(휴대폰)여야 함 → 0(공/영) 시작 강제
+    세는 말("하나 둘 셋...")·일상 음절·조사는 0 으로 시작하지 않거나 자릿수가 맞지
+    않아 배제된다. 인접 조사("...팔 이에요"의 '이')는 창 밖으로 떨어진다.
+    """
+    spans: list[dict] = []
+    for run in _spoken_digit_runs(text):
+        digits = [_spoken_word_to_digit(m.group(0)) for m in run]
+        i = 0
+        n = len(run)
+        while i < n:
+            matched = False
+            for size in _SPOKEN_PHONE_WINDOWS:
+                if i + size > n:
+                    continue
+                window = "".join(digits[i:i + size])
+                if _SPOKEN_MOBILE_RE.match(window):
+                    start = run[i].start()
+                    end = run[i + size - 1].end()
+                    spans.append({
+                        "type": "전화번호",
+                        "char_start": start,
+                        "char_end": end,
+                        "matched_text": text[start:end],
+                        # per-span tier hint (pii_confidence 가 type 기본값 대신 사용).
+                        "confidence": 0.95,
+                        "high_precision_pattern": True,
+                    })
+                    i += size  # 겹치지 않게 창 뒤로 이동
+                    matched = True
+                    break
+            if not matched:
+                i += 1
+    return spans
+
+
 def _matches_exclude_prefix(surname: str, given: str) -> bool:
     """성+이름이 제외 목록의 접두사와 일치하는지 확인한다.
 
@@ -245,6 +334,8 @@ def detect_pii_spans(
     text: str,
     enable_name_masking: bool = False,
     grade: Optional[CallGrade] = None,
+    *,
+    include_spoken_pii: bool = False,
 ) -> list[dict]:
     """텍스트에서 PII의 위치(span)를 감지하고 리스트로 반환한다.
 
@@ -282,6 +373,10 @@ def detect_pii_spans(
                     "char_end": m.end(),
                     "matched_text": m.group(0)
                 })
+
+    # 3. 음성 전사형 PII (candidate 전용 — 마스킹 경로는 기본 False 로 미동작)
+    if include_spoken_pii:
+        spans.extend(detect_spoken_phone_spans(text))
 
     return spans
 
