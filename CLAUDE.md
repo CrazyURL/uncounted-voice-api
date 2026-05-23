@@ -52,3 +52,35 @@ scripts/                 # 디버그 스크립트 (VRAM 확인, 파이프라인 
 - `.claude/rules/python/performance.md` — 성능 최적화 + DeepFilterNet + 청크 모드
 - `.claude/rules/python/config-and-pii.md` — 환경변수 테이블 + PII 마스킹 상세
 - Swagger UI: `http://{host}:{port}/docs`
+
+## 품질 지표 B-60 고착 버그 수정 — 2026-05-23
+
+**커밋**: `d40a8fd` (feat/window-b2-worker-fields)
+
+**원인**:
+`app/worker.py` `_get_audio_stats_sync()` 에서 `ffprobe -af`를 사용했으나,
+`ffprobe`는 오디오 필터 옵션 `-af`를 지원하지 않는다.
+`astats`/`silencedetect` 필터가 묵시적으로 실패하고 fallback 기본값이 반환되는 문제.
+
+```
+fallback: rms_db=-60, peak_db=-60, silence_ratio=0
+-> snr_db=0, speech_ratio=1.0, quality_score=60, quality_grade=B (모든 파일 동일)
+```
+
+**수정** (`app/worker.py`):
+- `ffprobe -af astats=...` -> `ffmpeg -v info -i <path> -af astats=... -f null -`
+- `ffprobe -af silencedetect=...` -> `ffmpeg -v info -i <path> -af silencedetect=... -f null -`
+- `returncode != 0` 시 `log.warning()` 추가
+- `_compute_quality()` 공식은 변경하지 않음
+- stderr 파싱 기존 로직 유지
+
+**검증**:
+| 파일 | score | grade |
+|------|-------|-------|
+| 무음 4초 | 20 | C |
+| 440Hz tone | 64 | B |
+| 백색잡음 | 66 | B |
+| 실제 음성 | 84 | A |
+
+**주의**: `app/worker.py` 수정 시 `ffprobe`를 audio filter 용도로 사용하지 말 것.
+audio filter는 반드시 `ffmpeg` 명령어로 실행하고 결과는 `proc.stderr`에서 파싱.
