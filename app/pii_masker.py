@@ -398,12 +398,19 @@ def detect_pii_spans(
     # 1. PII_PATTERNS 감지
     for pattern, _, label in PII_PATTERNS:
         for m in pattern.finditer(text):
-            spans.append({
+            span = {
                 "type": label,
                 "char_start": m.start(),
                 "char_end": m.end(),
                 "matched_text": m.group(0)
-            })
+            }
+            # 전화번호 형식 구분 (PR-S2): 구분자(하이픈/공백/점) 포함 형식은 형식이
+            # 명확하므로 auto_confirm hint 를 부여한다. 붙여쓰기 raw 숫자열은 hint 없이
+            # 검수(needs_human)로 남는다. 이 hint 는 후보 tier 합성(pii_confidence)에만
+            # 쓰이며 마스킹(mask_pii)은 이를 무시한다.
+            if label == "전화번호" and re.search(r"[\s.\-]", m.group(0)):
+                span["high_precision_pattern"] = True
+            spans.append(span)
 
     # 2. 이름 마스킹 감지
     if enable_name_masking:
