@@ -143,17 +143,25 @@ class AutoLabelService:
                     cls = out.last_hidden_state[:, 0]
 
                     emotion_probs = torch.softmax(self._emotion_head(cls), dim=-1)
-                    dialog_probs = torch.softmax(self._dialog_act_head(cls), dim=-1)
-
                     e_conf, e_idx = emotion_probs.max(dim=-1)
-                    d_conf, d_idx = dialog_probs.max(dim=-1)
+
+                    if self._dialog_act_head is not None:
+                        dialog_probs = torch.softmax(self._dialog_act_head(cls), dim=-1)
+                        d_conf, d_idx = dialog_probs.max(dim=-1)
+                    else:
+                        d_conf, d_idx = None, None
 
                 for j in range(len(batch)):
                     results.append(LabelResult(
                         emotion=self._emotion_labels[e_idx[j].item()],
                         emotion_confidence=round(e_conf[j].item(), 4),
-                        dialog_act=self._dialog_act_labels[d_idx[j].item()],
-                        dialog_act_confidence=round(d_conf[j].item(), 4),
+                        dialog_act=(
+                            self._dialog_act_labels[d_idx[j].item()]
+                            if d_idx is not None else None
+                        ),
+                        dialog_act_confidence=(
+                            round(d_conf[j].item(), 4) if d_conf is not None else 0.0
+                        ),
                         model_version=self._model_version,
                     ))
 
@@ -285,13 +293,18 @@ class AutoLabelService:
             if heads_path.exists():
                 heads = torch.load(str(heads_path), map_location="cpu")
                 self._emotion_head.load_state_dict(heads["emotion_head"])
-                self._dialog_act_head.load_state_dict(heads["dialog_act_head"])
-                logger.info("AutoLabelService: heads.pt 로드 완료")
+                if "dialog_act_head" in heads:
+                    self._dialog_act_head.load_state_dict(heads["dialog_act_head"])
+                    logger.info("AutoLabelService: heads.pt 로드 완료 (emotion + dialog_act)")
+                else:
+                    self._dialog_act_head = None
+                    logger.info("AutoLabelService: emotion-only 모델 — dialog_act_head 없음")
             else:
                 logger.warning("AutoLabelService: heads.pt 없음 — 랜덤 가중치로 초기화")
 
             self._emotion_head.eval()
-            self._dialog_act_head.eval()
+            if self._dialog_act_head is not None:
+                self._dialog_act_head.eval()
             self._model_version = model_path.name
             logger.info("AutoLabelService: 로드 완료 — %s", self._model_version)
 
