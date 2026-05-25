@@ -120,6 +120,11 @@ _HONORIFICS = (
     "아주머니", "아저씨", "삼촌", "이모", "고모", "외삼촌",
 )
 
+# IPv4 octet (0~255). 각 octet 을 0~255 로만 허용해 버전번호/임의 숫자열 오탐을 줄인다.
+# 주의: octet 검증은 코퍼스 일반 위생용이다. in-range 버전열(예: 10.0.0.1)은
+# octet 만으로는 걸러지지 않으며, 중복/시프트 후보는 _resolve_overlapping_spans 가 정리한다.
+_IP_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+
 # PII 패턴 정의 (순서 중요: 구체적인 패턴이 먼저)
 PII_PATTERNS = [
     # 주민등록번호: 900101-1234567
@@ -171,9 +176,15 @@ PII_PATTERNS = [
         lambda m: f"{m.group(1)}{'*' * len(m.group(2))}",
         "계좌번호",
     ),
-    # IP주소
+    # IP주소: 각 octet 0~255 검증 + 앞뒤 dot/digit 가드.
+    #   - (?<![\d.])  앞에 숫자/점이 있으면 매칭 안 함 (긴 숫자열·5+분절 버전열 좌측 배제)
+    #   - (?![\d.])   뒤에 숫자/점이 있으면 매칭 안 함 (1.2.3.4.5 / 192.168.0.1000 배제)
     (
-        re.compile(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b"),
+        re.compile(
+            r"(?<![\d.])"
+            rf"({_IP_OCTET})\.({_IP_OCTET})\.({_IP_OCTET})\.({_IP_OCTET})"
+            r"(?![\d.])"
+        ),
         lambda m: "***.***.***.***",
         "IP주소",
     ),
@@ -330,6 +341,42 @@ def _resolve_name_masking(
     return enable_name_masking
 
 
+def _resolve_overlapping_spans(spans: list[dict]) -> list[dict]:
+    """겹치는 span 을 우선순위로 1개만 남긴다 (detect/mask 공유 규칙).
+
+    ── 우선순위 정책 (greedy interval, 결정적) ──────────────────────────
+    정렬 키 = (char_start 오름차순, span 길이 내림차순) 후 앞에서부터 채택하고,
+    이미 채택된 span 과 겹치는 뒤 span 은 탈락시킨다.
+
+      1) 같은 시작 offset 이면 **더 긴 구조 span 이 이긴다.**
+         예) 계좌번호 5-19(14자리) ⊃ 전화번호 5-16(11자리)
+             → 긴 계좌가 채택되고 그 안에 포함된 전화 substring 은 탈락.
+             (010 으로 시작하는 더 긴 숫자열에서 앞 11자리 phone 오탐 제거)
+      2) **같은 시작·같은 길이**면 입력 순서(= PII_PATTERNS 선언 순서)를 유지한다.
+         전화(붙여쓰기) 패턴이 계좌 패턴보다 먼저 선언돼 있으므로,
+         정확히 11자리인 010 단독 숫자열(전화=계좌 동일 span)은 **전화번호로 유지**된다.
+      3) 시작 offset 이 다르고 구간이 겹치면(예: 1글자 시프트된 IP 5-19 / 6-20)
+         앞에서 채택된 span 이 이기고 나머지는 1건으로 정리된다.
+
+    주의: 이 함수는 dedup(중복 후보 제거)만 한다. confidence_tier 산정·
+    auto_confirmed/needs_human 강등 정책은 건드리지 않는다(그건 pii_confidence 책임).
+
+    반환은 **입력 순서를 보존**한다(응답 후보 순서 계약 최소 변경).
+    per-span hint(confidence/high_precision_pattern 등) 키도 그대로 보존된다.
+    """
+    order = sorted(
+        range(len(spans)),
+        key=lambda i: (spans[i]["char_start"], -(spans[i]["char_end"] - spans[i]["char_start"])),
+    )
+    keep = [False] * len(spans)
+    last_end = -1
+    for i in order:
+        if spans[i]["char_start"] >= last_end:
+            keep[i] = True
+            last_end = spans[i]["char_end"]
+    return [spans[i] for i in range(len(spans)) if keep[i]]
+
+
 def detect_pii_spans(
     text: str,
     enable_name_masking: bool = False,
@@ -378,7 +425,9 @@ def detect_pii_spans(
     if include_spoken_pii:
         spans.extend(detect_spoken_phone_spans(text))
 
-    return spans
+    # 4. 겹침/시프트/substring 중복 제거 (전화⊂계좌 이중태깅·IP 시프트 중복 정리).
+    #    mask_pii 와 동일한 규칙을 공유한다.
+    return _resolve_overlapping_spans(spans)
 
 
 def mask_pii(
@@ -394,20 +443,10 @@ def mask_pii(
         grade: 통화 등급 (049 v5). standard/excluded는 enable_name_masking 자동 True.
     """
     enable_name_masking = _resolve_name_masking(enable_name_masking, grade)
+    # detect_pii_spans 가 이미 겹침을 정리하지만, 직접 호출 경로 방어를 위해 한 번 더
+    # 동일 규칙으로 정리한다(멱등). 이후 역순 치환을 위해 시작 offset 내림차순 정렬.
     spans = detect_pii_spans(text, enable_name_masking)
-
-    # 중첩된 span 처리: 시작 위치 순, 길이 역순으로 정렬
-    spans.sort(key=lambda x: (x["char_start"], -(x["char_end"] - x["char_start"])))
-
-    # 중첩 제거 (먼저 나온 긴 패턴 우선)
-    non_overlapping = []
-    last_end = -1
-    for span in spans:
-        if span["char_start"] >= last_end:
-            non_overlapping.append(span)
-            last_end = span["char_end"]
-
-    # 역순 치환 (index 보존)
+    non_overlapping = _resolve_overlapping_spans(spans)
     non_overlapping.sort(key=lambda x: x["char_start"], reverse=True)
 
     masked_chars = list(text)
