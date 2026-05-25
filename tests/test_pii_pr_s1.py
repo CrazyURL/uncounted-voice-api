@@ -77,6 +77,41 @@ class TestIpOctetValidation:
             assert _IP_RE.search(s) is not None, f"in-range IP 가 탈락: {s}"
 
 
+# ── IP 미탐 기준 명확화 (PR-S1 regex 층의 탐지 경계 계약) ────────────────
+class TestIpVersionAmbiguityCriteria:
+    """regex 단독으로 IP 와 버전번호를 구분할 수 없는 경계를 '계약'으로 고정한다.
+
+    핵심 사실: 'in-range 4-octet 점표기 문자열'은 IP 와 버전번호가 **동일 문자열**이다.
+    예) "버전 10.45.49.12" 의 10.45.49.12 는 모든 octet 0~255 인 유효 IPv4 shape 이므로
+    regex 가 버전번호임을 알 방법이 없다 → PR-S1(regex/마스킹 층)은 이를 IP 로 마스킹한다.
+
+    ── PR-S1 IP 미탐(non-detection) 기준 (형태만으로 확정 가능한 경우로 한정) ──
+      [미탐 = IP 아님]  octet > 255  /  5분절 이상  /  앞뒤 숫자·점 인접(긴 숫자열)
+      [탐지·마스킹됨]   모든 octet 0~255 인 정확히 4분절  (버전번호여도 마스킹됨 — 알려진 한계)
+
+    in-range 버전번호의 오마스킹 회피는 regex 층이 아니라 **후보 큐/사람 검수(tier) 트랙**의
+    책임이다(design 문서 §2 근거: "octet 검증 통과해도 in-range 오탐"). 본 클래스는 그
+    경계를 회귀 테스트로 못박아, "regex 가 버전번호까지 걸러줄 것"이라는 잘못된 기대를 막는다.
+    """
+
+    @pytest.mark.parametrize(
+        "text,is_masked",
+        [
+            # in-range 4-octet → 버전번호여도 IP 로 마스킹됨 (regex 한계, tier 트랙이 처리).
+            ("버전 10.45.49.12 릴리스", True),
+            ("릴리스 1.2.3.4 노트", True),
+            # 아래는 형태만으로 IP 아님이 확정 → 미탐 (오마스킹 방지).
+            ("빌드 10.45.49.999 배포", False),   # octet > 255
+            ("버전 1.2.3.4.5 릴리스", False),     # 5분절
+            ("ver 192.168.0.1000 패치", False),  # 마지막 octet 4자리(긴 숫자열)
+        ],
+    )
+    def test_inrange_version_masked_out_of_range_not(self, text, is_masked):
+        result = mask_pii(text)
+        has_ip_mask = "***.***.***.***" in result["masked_text"]
+        assert has_ip_mask is is_masked, (text, result["masked_text"])
+
+
 # ── 2 & 3. 전화/계좌 이중태깅 제거 ──────────────────────────────────
 class TestPhoneAccountDedup:
     def test_normal_phone_detected(self):
