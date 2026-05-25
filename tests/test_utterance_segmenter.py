@@ -240,6 +240,56 @@ class TestCascadeMergeGuard:
         )
 
 
+class TestMergeV2Wiring:
+    """Segmenter v2 파이프라인 wiring — 기본 OFF, 신규 처리 전용.
+
+    핵심: MERGE_V2_ENABLED=false(기본)면 v1 출력 완전 동일.
+          true + bidirectional이면 긴 미완결 발화 뒤 짧은 연속 조각을 병합.
+    """
+
+    def _long_then_short(self):
+        # 긴(5.6s, 7단어) 미완결("하다가") + gap 0.6s 짧은 조각("말았어요")
+        # v1: SILENCE_GAP(0.5)로 분리되나 좌측이 5초↑라 _merge_short 가드로 병합 안 됨 → 2개
+        # v2 bidirectional: 미완결 긴 좌측이 짧은 우측을 흡수 → 1개
+        return [
+            _word("저는", 0.0, 0.5), _word("오늘", 0.6, 1.1),
+            _word("회사에", 1.2, 2.0), _word("가서", 2.1, 3.0),
+            _word("일을", 3.1, 4.0), _word("많이", 4.1, 5.0),
+            _word("하다가", 5.1, 5.6),
+            _word("말았어요", 6.2, 6.8),  # gap 0.6
+        ]
+
+    def test_off_by_default_keeps_v1_split(self, monkeypatch):
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MERGE_V2_ENABLED", False)
+        result = segment(self._long_then_short(), 10.0)
+        assert len(result) == 2, "기본 OFF면 v1 동작(5초 가드로 미병합) 그대로"
+
+    def test_on_bidirectional_merges(self, monkeypatch):
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MERGE_V2_ENABLED", True)
+        monkeypatch.setattr(cfg, "MERGE_V2_BIDIRECTIONAL", True)
+        result = segment(self._long_then_short(), 10.0)
+        assert len(result) == 1, "v2 bidirectional: 미완결 긴 발화가 짧은 연속 조각 흡수"
+        # 화자 순도 + max 길이 가드
+        assert all(u.speaker_id == "SPEAKER_0" for u in result)
+        assert all(u.duration_sec <= cfg.MAX_UTTERANCE_SEC for u in result)
+
+    def test_on_does_not_cross_speakers(self, monkeypatch):
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MERGE_V2_ENABLED", True)
+        monkeypatch.setattr(cfg, "MERGE_V2_BIDIRECTIONAL", True)
+        words = [
+            _word("저는", 0.0, 0.5, "SPEAKER_0"), _word("오늘", 0.6, 1.1, "SPEAKER_0"),
+            _word("회사에", 1.2, 2.0, "SPEAKER_0"), _word("가서", 2.1, 3.0, "SPEAKER_0"),
+            _word("일을", 3.1, 4.0, "SPEAKER_0"), _word("하다가", 4.1, 5.6, "SPEAKER_0"),
+            _word("응", 6.2, 6.8, "SPEAKER_1"),  # 다른 화자 짧은 조각 → 병합 금지
+        ]
+        result = segment(words, 10.0)
+        spk1 = [u for u in result if u.speaker_id == "SPEAKER_1"]
+        assert len(spk1) >= 1, "화자가 다르면 v2도 병합하지 않음"
+
+
 class TestPadding:
     def test_applies_padding(self):
         words = [_word("hello", 1.0, 2.0)]

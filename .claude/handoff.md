@@ -1,50 +1,44 @@
 # Handoff Document
-생성일시: 2026-04-19 KST
+생성일시: 2026-05-26 KST
 effort: high
+track: STT 발화분리 품질 (Segmenter v2)
+
+## 0. 상태 INDEX (현재 트랙)
+
+- ✅ STT 발화분리 **진단 완료** (read-only, live 60세션/5,643발화)
+- ✅ Segmenter v2 **설계·구현·테스트 완료** (순수함수, forward+bidirectional)
+- ⛔ worker **wiring 미적용** (계획서만 작성: `docs/stt-segmenter-v2-wiring-plan.md`)
+- ⛔ **DB write / prod 반영 / 재처리 없음** — 전부 미실행
+- 커밋: `e1f87a4` (branch `feat/stt-segmenter-v2`, 6파일만, PII 변경 미포함, 미푸시)
 
 ## 1. 완료한 작업
 
-- **로컬 게인 정규화 추가** (`audio_preprocessor.py`): 500ms 슬라이딩 윈도우 기반 `local_normalize_gain()` 신규 구현. 글로벌 10x 제한 이후에도 조용한 구간을 최대 30x로 부스트해 VAD 감지 개선.
-- **pyannote VAD 임계값 주입 우회** (`stt_processor.py`): whisperx Pyannote.__init__가 vad_onset/vad_offset을 load_vad_model()에 전달하지 않는 버그를 `__new__` + 직접 vad_pipeline 주입으로 우회. VAD_ONSET=0.150, VAD_OFFSET=0.100 적용.
-- **hanging word 보정** (`utterance_segmenter.py`): 발화 끝 단어가 0.3초 이상 gap 이후 고립된 경우 다음 발화 앞으로 이동하는 `_fix_hanging_words()` 추가.
-- **cascade merge 버그 수정** (`utterance_segmenter.py`): 같은 화자 발화가 무한 병합되던 버그 수정. `last.duration < MIN_UTTERANCE_SEC` 조건 추가.
-- **신규 config 변수 5개** (`config.py`): DIARIZATION_MODEL, HANGING_WORD_GAP_SEC, LOCAL_MAX_GAIN_X, VAD_ONSET, VAD_OFFSET
-- **테스트 추가** (`test_audio_preprocessor.py`, `test_utterance_segmenter.py`): 16 + 5 = 21개 신규 테스트
+- **진단**: 1차 원인 = postprocess 병합 한계(v1의 5초 가드). VAD/WhisperX/diarization 아님.
+  근거: <0.5s 단편 4%, 종결어미 끝 15%, 같은-화자 gap≤0.8 병합가능 257쌍.
+- **Segmenter v2** (`app/services/utterance_segmenter_v2.py`): `merge_v2` 순수함수.
+  같은 화자·gap≤0.8·짧음(2s/5단어)·문장종결 중단·max 13s·PII straddle 보존. forward + bidirectional.
+- **종결어미 휴리스틱** (`app/services/korean_sentence_ending.py`): 종결/연결/조사 판정.
+- **진단 스크립트** (`scripts/analysis/stt_segmentation_audit.py`): read-only Supabase + dry-run.
+- **리포트** (`scripts/analysis/stt_segmentation_quality_audit_20260525.md`).
+- **config** (`app/config.py`): `MERGE_V2_*` 임계값 4개.
+- 테스트: v2 15 + v1 회귀 21 = **36 passed**.
 
-## 2. 변경 파일 요약
+## 2. 핵심 수치 (dry-run, DB 미반영)
 
-| 파일 | 변경 유형 | 설명 |
-|------|----------|------|
-| `app/config.py` | 수정 | 5개 env var 추가 |
-| `app/services/audio_preprocessor.py` | 수정 | local_normalize_gain() + preprocess 파이프라인 연결 |
-| `app/services/utterance_segmenter.py` | 수정 | _fix_hanging_words() + cascade merge 버그 수정 |
-| `app/stt_processor.py` | 수정 | VAD 임계값 주입 우회 + DIARIZATION_MODEL config 적용 |
-| `tests/test_audio_preprocessor.py` | 수정 | TestNormalizeGain, TestLocalNormalizeGain, TestGainPipelineIntegration (16 tests) |
-| `tests/test_utterance_segmenter.py` | 수정 | TestCascadeMergeGuard, TestFixHangingWords (5 tests) |
+| 모드 | 발화 감소 | 짧은 단편 감소 |
+|---|---|---|
+| forward (명세) | −1.1% | −3.8% |
+| **bidirectional (권장)** | **−3.3%** | **−11.0%** |
 
-## 3. 테스트 필요 사항
+## 3. 다음 단계 (각각 별도 승인 게이트)
 
-- [ ] pytest 전체 통과 확인
-- [ ] local_normalize_gain: 조용한 구간 부스트 + 무음 과증폭 방지
-- [ ] _fix_hanging_words: 이동 조건 정확성
-- [ ] cascade merge guard: 무한 병합 방지
+- [ ] **worker wiring**: `docs/stt-segmenter-v2-wiring-plan.md` 승인 → 별도 PR. flag OFF 기본.
+- [ ] hotwords/INITIAL_PROMPT IT보안 도메인 + 수석님 교정 (분리 트랙).
+- [ ] short-heavy 세션 한정 단계적 재처리 (분리 트랙).
 
-## 4. 알려진 이슈 / TODO
+## 4. 주의사항
 
-- [ ] VAD 주입 우회가 whisperx 업데이트 시 깨질 수 있음 (try/except 폴백 미구현)
-- [ ] local_normalize_gain의 logger.info가 INFO 레벨로 과다 출력됨 (→ DEBUG 권장)
-- [ ] config-and-pii.md 문서에 신규 env var 5개 미반영
-
-## 5. 주의사항
-
-- VAD 주입은 whisperx 내부 API 의존 — 업데이트 시 확인 필요
-- _fix_hanging_words는 루프 중 result[i+1]을 수정 후 다음 반복에서 재사용 (캐스케이드 의도적)
-- GPU 서버에서만 실제 STT 동작 확인 가능 — pytest는 로컬/CI에서만
-
-## 6. 검증 권장 설정
-
-- effort: high
-- security: false
-- coverage: true
-- only: all
-- loop: 3
+- working tree에 **무관한 PII 트랙 변경**(pii_masker.py 등) 존재 — 본 커밋에 미포함, 섞지 말 것.
+- `test_v3_pii_regression.py` 1건 실패는 **PII 트랙 소관**, 본 트랙과 무관(기록만).
+- v2 wiring 시 PII interval은 `segment()` 시점에 없음 → straddle 보호는 신규 처리에서 무의미(병합은 절단 안 함). 계획서 1절 참조.
+- 기존 utterance row 재처리는 금지(신규 처리 전용). 백필은 별도 과제.
