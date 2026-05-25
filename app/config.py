@@ -91,6 +91,16 @@ SILENCE_RMS_THRESHOLD_DENOISE = float(os.environ.get("SILENCE_RMS_THRESHOLD_DENO
 # 발화 끝 떠돌이 단어(hanging word) 보정 — 직전 단어와 이 간격 이상이면 다음 발화로 이동
 HANGING_WORD_GAP_SEC = float(os.environ.get("HANGING_WORD_GAP_SEC", "0.3"))
 
+# ─────────────────────────────────────────────────────────────
+# Segmenter v2 — 발화 단위 후처리 병합 (utterance_segmenter_v2)
+# 같은 화자의 짧은 인접 발화를 문장 종결 단위에 가깝게 병합한다.
+# 현재는 순수함수/진단 dry-run 용도이며 라이브 파이프라인 wiring은 별도 승인 후.
+# ─────────────────────────────────────────────────────────────
+MERGE_V2_GAP_SEC = float(os.environ.get("MERGE_V2_GAP_SEC", "0.8"))        # 병합 허용 최대 gap
+MERGE_V2_MAX_SEC = float(os.environ.get("MERGE_V2_MAX_SEC", "13.0"))       # 병합 결과 최대 길이
+MERGE_V2_SHORT_SEC = float(os.environ.get("MERGE_V2_SHORT_SEC", "2.0"))    # 병합 후보 짧음 기준(초)
+MERGE_V2_SHORT_WORDS = int(os.environ.get("MERGE_V2_SHORT_WORDS", "5"))    # 병합 후보 짧음 기준(단어)
+
 # Gain Normalize 최대 증폭 (노이즈 증폭 방지)
 MAX_GAIN_X = float(os.environ.get("MAX_GAIN_X", "10.0"))
 # 로컬 게인 정규화 최대 증폭 — 글로벌보다 높게 허용하여 조용한 구간의 VAD 감지 개선
