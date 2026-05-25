@@ -78,6 +78,8 @@ def _normalize(unit: dict) -> dict:
         "word_count": int(word_count),
         "pii_intervals": list(unit.get("pii_intervals") or []),
         "numeric_patterns": list(unit.get("numeric_patterns") or []),
+        # word 단위 타임스탬프 패스스루 (파이프라인 wiring 시 _RawUtterance 재구성용; DB 경로는 미사용)
+        "words": list(unit.get("words") or []),
     }
 
 
@@ -137,6 +139,7 @@ def _merge(current: dict, nxt: dict) -> dict:
         "word_count": current["word_count"] + nxt["word_count"],
         "pii_intervals": current["pii_intervals"] + nxt["pii_intervals"],
         "numeric_patterns": current["numeric_patterns"] + nxt["numeric_patterns"],
+        "words": current["words"] + nxt["words"],
     }
 
 

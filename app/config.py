@@ -100,6 +100,9 @@ MERGE_V2_GAP_SEC = float(os.environ.get("MERGE_V2_GAP_SEC", "0.8"))        # 병
 MERGE_V2_MAX_SEC = float(os.environ.get("MERGE_V2_MAX_SEC", "13.0"))       # 병합 결과 최대 길이
 MERGE_V2_SHORT_SEC = float(os.environ.get("MERGE_V2_SHORT_SEC", "2.0"))    # 병합 후보 짧음 기준(초)
 MERGE_V2_SHORT_WORDS = int(os.environ.get("MERGE_V2_SHORT_WORDS", "5"))    # 병합 후보 짧음 기준(단어)
+# 파이프라인 wiring 스위치 — 기본 OFF (켜기 전까지 v1 동작 완전 동일, 신규 처리에만 영향)
+MERGE_V2_ENABLED = os.environ.get("MERGE_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+MERGE_V2_BIDIRECTIONAL = os.environ.get("MERGE_V2_BIDIRECTIONAL", "true").lower() in ("true", "1", "yes")
 
 # Gain Normalize 최대 증폭 (노이즈 증폭 방지)
 MAX_GAIN_X = float(os.environ.get("MAX_GAIN_X", "10.0"))

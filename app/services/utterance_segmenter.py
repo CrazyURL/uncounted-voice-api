@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from app import config
+from app.services.utterance_segmenter_v2 import merge_v2
 
 
 @dataclass(frozen=True)
@@ -26,7 +27,8 @@ def segment(words: list[dict], total_duration: float) -> list[UtteranceBoundary]
     fixed = _fix_hanging_words(raw)
     merged = _merge_short_utterances(fixed)
     split = _split_long_utterances(merged)
-    return _apply_padding(split, total_duration)
+    final = _merge_v2_step(split)
+    return _apply_padding(final, total_duration)
 
 
 # -- Internal types --
@@ -220,6 +222,38 @@ def _split_at_midpoint(u: _RawUtterance) -> list[_RawUtterance]:
     right = _RawUtterance(u.speaker_id, u.words[best_idx + 1:])
 
     return _split_at_midpoint(left) + _split_at_midpoint(right)
+
+
+# -- Step 5.5: Segmenter v2 후처리 병합 (기본 OFF, 신규 처리 전용) --
+
+def _merge_v2_step(utterances: list[_RawUtterance]) -> list[_RawUtterance]:
+    """MERGE_V2_ENABLED=true일 때만 같은-화자 짧은 발화를 문장 종결 기준으로 추가 병합.
+
+    OFF(기본)이면 입력을 그대로 반환 → v1 동작 완전 동일. 재처리와 무관(신규 처리 경로).
+    """
+    if not config.MERGE_V2_ENABLED or len(utterances) <= 1:
+        return utterances
+
+    units = [_to_v2_unit(u) for u in utterances]
+    merged = merge_v2(units, bidirectional=config.MERGE_V2_BIDIRECTIONAL)
+    return [_RawUtterance(m["speaker_id"], list(m["words"])) for m in merged]
+
+
+def _to_v2_unit(u: _RawUtterance) -> dict:
+    """_RawUtterance → merge_v2 입력 dict (words 패스스루 포함)."""
+    text = " ".join(
+        w.get("word", w.get("text", "")).strip()
+        for w in u.words
+        if w.get("word") or w.get("text")
+    )
+    return {
+        "start_sec": _to_float(u.words[0].get("start")) if u.words else 0.0,
+        "end_sec": _to_float(u.words[-1].get("end")) if u.words else 0.0,
+        "speaker_id": u.speaker_id,
+        "transcript_text": text,
+        "word_count": len(u.words),
+        "words": list(u.words),
+    }
 
 
 # -- Step 6: Apply padding --
