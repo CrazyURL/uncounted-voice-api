@@ -58,6 +58,17 @@ _CONFIDENCE_AMBIGUOUS = 0.70
 _CONFIDENCE_REVIEW = 0.70
 _CONFIDENCE_WEAK = 0.40
 
+# 이름 graded confidence: detect_pii_spans 가 부착한 name_context 범주 → confidence.
+# 목적은 마스킹(탐지)은 유지하되 **검수 큐 우선순위만** 차등화하는 것이다.
+#   - honorific(0.85)/mid(0.70): ambiguous 유지 → needs_human_decision (큐 유지, confidence 만 차등)
+#   - weak_trailing(0.40):       ambiguous 해제 → <0.50 → auto_rejected (사람 큐에서 이탈)
+# 어떤 경우에도 span 은 detect_pii_spans 가 그대로 emit 하므로 mask_pii recall 은 불변이다.
+_NAME_CONTEXT_CONFIDENCE: dict[str, float] = {
+    "honorific": 0.85,
+    "mid": 0.70,
+    "weak_trailing": 0.40,
+}
+
 # tier 임계값.
 _AUTO_CONFIRMED_MIN = 0.90
 _NEEDS_HUMAN_MIN = 0.50
@@ -101,15 +112,24 @@ def _score_one(span: dict) -> dict:
     hint 가 없는 기존 패턴은 종전과 동일하게 type 기반으로 합성된다(하위호환).
     """
     pii_type = span["type"]
+    # 이름 graded confidence 문맥 범주(있으면). 탐지/마스킹과 무관, 검수 tier 강등용.
+    name_context = span.get("name_context")
     high_precision = span.get("high_precision_pattern")
     if high_precision is None:
         high_precision = pii_type in AUTO_CONFIRM_TYPES
     ambiguous = span.get("type_ambiguous")
     if ambiguous is None:
-        ambiguous = pii_type in AMBIGUOUS_TYPES
+        if name_context is not None:
+            # weak_trailing 은 약한 후보 → ambiguous 해제해 confidence 기반 auto_rejected 를 허용.
+            # honorific/mid 는 ambiguous 유지 → needs_human_decision.
+            ambiguous = name_context != "weak_trailing"
+        else:
+            ambiguous = pii_type in AMBIGUOUS_TYPES
     confidence = span.get("confidence")
     if confidence is None:
-        if high_precision:
+        if name_context is not None:
+            confidence = _NAME_CONTEXT_CONFIDENCE.get(name_context, _CONFIDENCE_AMBIGUOUS)
+        elif high_precision:
             confidence = _CONFIDENCE_HIGH_PRECISION
         elif ambiguous:
             confidence = _CONFIDENCE_AMBIGUOUS
