@@ -120,6 +120,14 @@ _HONORIFICS = (
     "아주머니", "아저씨", "삼촌", "이모", "고모", "외삼촌",
 )
 
+# 3글자 이름(성+2글자) 직후에 흔히 붙는 조사/어미 어두 글자.
+# ⚠️ detection 억제용이 아니다(이름+조사 "김용철이"와 일반어+조사 "정상화를"를 구분 못 해
+#    마스킹 recall 을 깬다 — 검증 완료). 오직 confidence_tier 강등(검수 큐 우선순위)에만 쓴다.
+#    마스킹 경로는 이 분류와 무관하게 span 을 그대로 마스킹한다.
+_NAME_TRAILING_JOSA_EOMI = frozenset(
+    "을를이가은는에의도만과와로으한했하해인임라고며면서게지네요죠까란답"
+)
+
 # IPv4 octet (0~255). 각 octet 을 0~255 로만 허용해 버전번호/임의 숫자열 오탐을 줄인다.
 # 주의: octet 검증은 코퍼스 일반 위생용이다. in-range 버전열(예: 10.0.0.1)은
 # octet 만으로는 걸러지지 않으며, 중복/시프트 후보는 _resolve_overlapping_spans 가 정리한다.
@@ -321,6 +329,22 @@ def _is_likely_name_with_context(
     return True
 
 
+def _name_context(after: str) -> str:
+    """이름 span 의 검수 confidence 문맥 범주를 반환한다 (탐지 여부와 무관, 강등용).
+
+    - "honorific":     뒤에 호칭(_HONORIFICS) → 이름 신호 강함
+    - "weak_trailing": 뒤가 조사/어미로 이어짐 → 더 긴 단어/활용형일 가능성, 약한 후보
+    - "mid":           그 외(경계 후행 bare 3글자 등) → 일반 후보
+    """
+    after_stripped = after.lstrip()
+    for h in _HONORIFICS:
+        if after_stripped.startswith(h):
+            return "honorific"
+    if after and after[0] in _NAME_TRAILING_JOSA_EOMI:
+        return "weak_trailing"
+    return "mid"
+
+
 # ── 통화 등급 (049 v5 정합) ────────────────────────────────────────────
 # 'premium': 양측 개인. enable_name_masking은 호출자 옵션.
 # 'standard': 한쪽이 기업/가상번호 (직무 발화자 비식별화 의무, 약관 v1.2 제5조의2 3항).
@@ -421,11 +445,14 @@ def detect_pii_spans(
             after = text[m.end():]
 
             if _is_likely_name_with_context(s, g, before, after):
+                # name_context: 검수 confidence 강등용 범주 hint (pii_confidence 가 점수로 매핑).
+                # 탐지/마스킹에는 영향 없음 — span 은 항상 emit 된다.
                 spans.append({
                     "type": "이름",
                     "char_start": m.start(),
                     "char_end": m.end(),
-                    "matched_text": m.group(0)
+                    "matched_text": m.group(0),
+                    "name_context": _name_context(after),
                 })
 
     # 3. 음성 전사형 PII (candidate 전용 — 마스킹 경로는 기본 False 로 미동작)
