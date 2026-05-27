@@ -31,6 +31,12 @@ MAX_RETRY_COUNT = 3
 VOICE_API_POLL_INTERVAL_SEC = 1
 VOICE_API_MAX_WAIT_SEC = 300        # 5 min
 
+# D4b: worker 는 voice-api 에 pii_intervals_only 만 요청한다(시간범위 메타데이터만 산출,
+# 1kHz 비프 미적용 → 저장 발화 WAV 원본 유지). mask_audio_pii(D5 음향 마스킹)는 요청하지 않음.
+# 저장 WAV 가 마스킹되지 않았으므로 persist 되는 pii_intervals 의 maskType 은 "text_only"
+# (텍스트만 마스킹, 오디오 원본, 마스킹은 admin 스트리밍/export 소비 시점에 적용). 비프 경로면 "audio".
+PII_INTERVAL_MASK_TYPE = "text_only"
+
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "2"))
 VOICE_API_URL = os.getenv("VOICE_API_URL", "http://localhost:8001")
 
@@ -148,16 +154,24 @@ async def download_raw_audio(raw_audio_url: str) -> str:
 
 # ── Voice API ─────────────────────────────────────────────────────────
 
-async def submit_to_voice_api(audio_path: str) -> str:
-    """POST audio file to voice_api; return task_id. 503 → Voice503Error."""
-    params = {
+def build_submit_params() -> dict:
+    """voice-api /transcribe 요청 query params. D4b: pii_intervals_only 만 추가하고
+    mask_audio_pii(D5 비프)는 전달하지 않는다(voice-api 기본 false 유지)."""
+    return {
         "language": "ko",
         "diarize": "true",
         "split_by_utterance": "true",
         "split_by_speaker": "true",
         "mask_pii": "true",
         "denoise": "true",
+        # PII 시간범위 메타데이터만 산출(오디오 미변형). 저장 발화 WAV 원본 유지.
+        "pii_intervals_only": "true",
     }
+
+
+async def submit_to_voice_api(audio_path: str) -> str:
+    """POST audio file to voice_api; return task_id. 503 → Voice503Error."""
+    params = build_submit_params()
     url = f"{VOICE_API_URL}/api/v1/transcribe"
     ext = audio_path.rsplit(".", 1)[-1].lower() if "." in audio_path else "wav"
     with open(audio_path, "rb") as f:
@@ -285,6 +299,54 @@ def _compute_quality(rms_db: float, peak_db: float, silence_ratio: float) -> tup
 
 # ── Persist results ───────────────────────────────────────────────────
 
+def build_pii_intervals(
+    pii_summary: list[dict],
+    utt_start: float,
+    utt_end: float,
+    mask_type: str = PII_INTERVAL_MASK_TYPE,
+) -> list[dict]:
+    """job-level pii_summary.time_ranges 중 발화 구간 [utt_start, utt_end) 과 겹치는 것만
+    utterance-level pii_intervals 로 변환한다. maskType=저장 WAV provenance(D4b: text_only).
+    원문 텍스트는 포함하지 않는다(startSec/endSec/maskType/piiType 만)."""
+    intervals: list[dict] = []
+    for pii_item in pii_summary:
+        for tr in pii_item.get("time_ranges", []):
+            if tr["start"] < utt_end and tr["end"] > utt_start:
+                intervals.append({
+                    "startSec": round(tr["start"], 2),
+                    "endSec": round(tr["end"], 2),
+                    "maskType": mask_type,
+                    "piiType": pii_item["type"],
+                })
+    return intervals
+
+
+def curated_sequence_orders(rows: list[dict] | None) -> set[int]:
+    """정책 P: 사람이 검수(pii_reviewed_at)하거나 마스킹(pii_masked_at)한 흔적이 있는
+    sequence_order 집합. 이 행들의 pii_intervals 는 worker 가 덮어쓰지 않는다."""
+    out: set[int] = set()
+    for row in rows or []:
+        if row.get("pii_reviewed_at") is not None or row.get("pii_masked_at") is not None:
+            so = row.get("sequence_order")
+            if so is not None:
+                out.add(int(so))
+    return out
+
+
+def strip_pii_if_curated(
+    row: dict,
+    seq: int,
+    curated_seqs: set[int],
+    precheck_ok: bool,
+) -> dict:
+    """정책 P 적용: 해당 발화가 수동 검수/마스킹됐거나(curated) 사전조회가 실패(precheck_ok=False)하면
+    upsert payload 에서 pii_intervals 키를 제거해 기존 값을 보존한다(나머지 STT/품질/라벨 컬럼은 갱신).
+    precheck 실패 시 보수적으로 전 행 보존(사람 교정 손실 위험 > 자동 interval 미기록 비용)."""
+    if not precheck_ok or seq in curated_seqs:
+        row.pop("pii_intervals", None)
+    return row
+
+
 async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     """
     For each utterance: download WAV from voice_api → compute quality via ffprobe
@@ -324,6 +386,26 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             log.warning("[%s] session_speakers upsert failed (%s): %s", session_id, spk["speaker_label"], e)
 
     pii_summary = job_result.get("pii_summary", [])
+
+    # D4b 정책 P: 수동 검수/마스킹된 발화의 pii_intervals 는 worker 가 덮어쓰지 않는다.
+    # upsert 전에 기존 행의 pii_reviewed_at/pii_masked_at 를 한 번에 조회해 보존 대상 seq 집합을 만든다.
+    # 조회 실패 시 precheck_ok=False → 보수적으로 전 행의 pii_intervals 를 보존(덮어쓰기 회피).
+    curated_seqs: set[int] = set()
+    precheck_ok = True
+    try:
+        existing = await _run(
+            lambda: _supabase.table("utterances")
+            .select("sequence_order, pii_reviewed_at, pii_masked_at")
+            .eq("session_id", session_id)
+            .execute()
+        )
+        curated_seqs = curated_sequence_orders(existing.data)
+    except Exception as e:
+        precheck_ok = False
+        log.warning(
+            "[%s] pii curation precheck 실패 — 보수적으로 pii_intervals 덮어쓰기 보류: %s",
+            session_id, e,
+        )
 
     upserted = 0
     for i, utt in enumerate(utterances):
@@ -368,16 +450,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
         )
         utt_start = float(utt.get("start_sec") or 0)
         utt_end = float(utt.get("end_sec") or 0)
-        pii_intervals = []
-        for pii_item in pii_summary:
-            for tr in pii_item.get("time_ranges", []):
-                if tr["start"] < utt_end and tr["end"] > utt_start:
-                    pii_intervals.append({
-                        "startSec": round(tr["start"], 2),
-                        "endSec": round(tr["end"], 2),
-                        "maskType": "audio",
-                        "piiType": pii_item["type"],
-                    })
+        pii_intervals = build_pii_intervals(pii_summary, utt_start, utt_end)
 
         speaker_label: str | None = utt.get("speaker_id")
         row = {
@@ -424,6 +497,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "language_mix_flag": utt.get("language_mix_flag"),
             "updated_at": _now_iso(),
         }
+        # 정책 P: 수동 검수/마스킹된 행(또는 precheck 실패)이면 pii_intervals 를 payload 에서 제거해 보존.
+        row = strip_pii_if_curated(row, seq, curated_seqs, precheck_ok)
         await _run(
             lambda r=row: _supabase.table("utterances")
             .upsert(r, on_conflict="session_id,sequence_order")
