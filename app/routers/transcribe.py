@@ -35,6 +35,7 @@ def _process_audio(
     denoise: bool | None = None,
     mask_audio_pii: bool = False,
     mask_audio_names: bool = False,
+    pii_intervals_only: bool = False,
     reference_embedding: str | None = None,
 ):
     """Background task: run WhisperX pipeline and update job store."""
@@ -57,6 +58,7 @@ def _process_audio(
             denoise_enabled=denoise,
             mask_audio_pii=mask_audio_pii,
             mask_audio_names=mask_audio_names,
+            pii_intervals_only=pii_intervals_only,
             reference_embedding=ref_emb,
         )
         audio_files = result.pop("_audio_files", None)
@@ -181,6 +183,13 @@ async def transcribe_audio(
         description="음성 내 이름 마스킹 활성화 여부. `mask_audio_pii=true`일 때만 유효하며, "
         "한국 성씨+이름 패턴을 탐지하여 비프음 처리합니다.",
     ),
+    pii_intervals_only: bool = Query(
+        False,
+        description="PII time_range 메타데이터만 산출합니다(오디오 미변형). `mask_audio_pii`와 독립적으로 "
+        "동작하며, `true`로 설정하면 PII 구간의 시간 범위(`pii_summary[].time_ranges`)는 산출하되 "
+        "1kHz 비프음 치환은 적용하지 않아 저장되는 발화 WAV가 원본과 동일하게 유지됩니다. "
+        "`mask_audio_pii=true`와 함께 설정되면 비프음 치환이 우선 적용됩니다(오디오 보호 우선).",
+    ),
     reference_embedding: str | None = Query(
         None,
         description="발화자 voice profile 임베딩 (JSON float 배열). "
@@ -262,6 +271,7 @@ async def transcribe_audio(
         denoise,
         mask_audio_pii,
         mask_audio_names,
+        pii_intervals_only,
         reference_embedding,
     )
 

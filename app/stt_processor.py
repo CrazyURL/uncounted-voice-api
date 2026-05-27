@@ -440,6 +440,7 @@ def _transcribe_chunked(
     diarization_options: dict | None = None,
     mask_audio_pii: bool = False,
     mask_audio_names: bool = False,
+    pii_intervals_only: bool = False,
 ) -> tuple[list[dict], list[dict], dict[str, bytes], list[tuple[float, float, str]]]:
     """대용량 오디오를 무음 기반으로 청크 분할하여 처리한다.
 
@@ -514,15 +515,19 @@ def _transcribe_chunked(
             chunk_segments = _transcribe_chunk(chunk_audio, task_id, enable_diarize, diarization_options)
 
             # 4. 음성 PII 마스킹 (청크 모드)
-            if mask_audio_pii:
+            # D4b: range 산출 게이트 = (mask_audio_pii OR pii_intervals_only),
+            # 오디오 변형(beep) 게이트 = mask_audio_pii 단독. pii_intervals_only 는
+            # chunk_audio 를 변형하지 않으므로 emit 되는 발화 WAV 가 원본과 동일하게 유지된다.
+            if mask_audio_pii or pii_intervals_only:
                 chunk_pii_ranges = find_pii_word_ranges(
                     chunk_segments,
                     enable_name_masking=mask_audio_names,
                     pad_sec=config.PII_MASK_PAD_SEC,
                 )
                 if chunk_pii_ranges:
-                    chunk_audio = mask_audio_ranges(chunk_audio, chunk_pii_ranges, config.SAMPLE_RATE)
-                    # 글로벌 타임라인으로 변환하여 저장
+                    if mask_audio_pii:
+                        chunk_audio = mask_audio_ranges(chunk_audio, chunk_pii_ranges, config.SAMPLE_RATE)
+                    # 글로벌 타임라인으로 변환하여 저장 (beep 여부와 무관하게 range 기록)
                     for s, e, t in chunk_pii_ranges:
                         all_pii_audio_ranges.append((
                             s + cumulative_preprocessed_offset,
@@ -579,6 +584,7 @@ def transcribe(
     denoise_enabled: bool | None = None,
     mask_audio_pii: bool = False,
     mask_audio_names: bool = False,
+    pii_intervals_only: bool = False,
     reference_embedding: list[float] | None = None,
 ) -> dict:
     """음성 파일을 STT 처리하고 마스킹된 결과를 반환한다.
@@ -622,6 +628,7 @@ def transcribe(
                 diarization_options=diarization_options,
                 mask_audio_pii=mask_audio_pii,
                 mask_audio_names=audio_name_masking,
+                pii_intervals_only=pii_intervals_only,
             )
             audio = None
             diarize_active = enable_diarize and _diarize_model is not None
@@ -678,13 +685,17 @@ def transcribe(
             # 5. 음성 PII 마스킹 (일반 모드)
             # PII 이름 마스킹: 텍스트와 음성을 OR로 동기화 (chunked 모드와 동일 정책).
             audio_name_masking = mask_audio_names or enable_name_masking
-            if mask_audio_pii:
+            # D4b: range 산출 게이트 = (mask_audio_pii OR pii_intervals_only).
+            # 오디오 변형(1kHz beep) 게이트 = mask_audio_pii 단독.
+            # pii_intervals_only 는 time_range 메타데이터만 산출하고 audio 를 변형하지 않으므로
+            # 이 경로에서 잘려나가는 발화 WAV 는 비-PII 경로와 바이트 동일하게 유지된다.
+            if mask_audio_pii or pii_intervals_only:
                 pii_audio_ranges = find_pii_word_ranges(
                     segments,
                     enable_name_masking=audio_name_masking,
                     pad_sec=config.PII_MASK_PAD_SEC,
                 )
-                if pii_audio_ranges:
+                if pii_audio_ranges and mask_audio_pii:
                     audio = mask_audio_ranges(audio, pii_audio_ranges, config.SAMPLE_RATE)
                     logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간)", task_id, len(pii_audio_ranges))
 
@@ -699,7 +710,8 @@ def transcribe(
         pii_summary = mask_segments(segments, enable_name_masking) if mask_pii else []
 
         # 5.5 pii_summary에 음성 마스킹 시간 범위 통합 (immutable)
-        if mask_audio_pii and pii_audio_ranges:
+        # D4b: pii_intervals_only 모드에서도 time_ranges 는 emit 한다 (beep 없이 메타데이터만).
+        if (mask_audio_pii or pii_intervals_only) and pii_audio_ranges:
             type_to_ranges: dict[str, list[dict]] = {}
             for r_start, r_end, p_type in pii_audio_ranges:
                 type_to_ranges.setdefault(p_type, []).append(

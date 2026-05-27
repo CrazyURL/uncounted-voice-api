@@ -25,6 +25,7 @@ class WhisperXService:
         denoise_enabled: bool | None = None,
         mask_audio_pii: bool = False,
         mask_audio_names: bool = False,
+        pii_intervals_only: bool = False,
         reference_embedding: list[float] | None = None,
     ) -> dict:
         return transcribe(
@@ -38,6 +39,7 @@ class WhisperXService:
             denoise_enabled=denoise_enabled,
             mask_audio_pii=mask_audio_pii,
             mask_audio_names=mask_audio_names,
+            pii_intervals_only=pii_intervals_only,
             reference_embedding=reference_embedding,
         )
 
