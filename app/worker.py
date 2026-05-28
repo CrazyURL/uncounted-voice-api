@@ -19,6 +19,8 @@ import boto3
 from botocore.config import Config
 from supabase import create_client, Client
 
+from app.sanitize_json import sanitize_json_safe
+
 # TODO(post-seed): worker_heartbeats 테이블 + 어드민 5분 무응답 알람
 
 # ── Constants (matched 1:1 with gpu-worker.ts) ────────────────────────
@@ -375,6 +377,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "speaker_relation": spk.get("speaker_relation"),
         }
         try:
+            # NaN/Inf 가드: persist 경계에서 한 번 차단(현재는 string/enum payload 만이나 방어용).
+            spk_row = sanitize_json_safe(spk_row)
             result = await _run(
                 lambda r=spk_row: _supabase.table("session_speakers")
                 .upsert(r, on_conflict="session_id,speaker_label")
@@ -499,6 +503,9 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
         }
         # 정책 P: 수동 검수/마스킹된 행(또는 precheck 실패)이면 pii_intervals 를 payload 에서 제거해 보존.
         row = strip_pii_if_curated(row, seq, curated_seqs, precheck_ok)
+        # NaN/Inf 가드: snr_db / transcript_words(WhisperX alignment) / *_confidence 등 모델 산출
+        # 부동소수가 NaN/Inf 일 때 None 으로 치환(json.dumps allow_nan=False 통과 보장).
+        row = sanitize_json_safe(row)
         await _run(
             lambda r=row: _supabase.table("utterances")
             .upsert(r, on_conflict="session_id,sequence_order")
@@ -519,6 +526,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "utterance_count": len(seg.get("utterance_indices", [])),
         }
         try:
+            # NaN/Inf 가드: 현재 payload 는 int/str 만이나 방어용으로 persist 경계에서 차단.
+            seg_row = sanitize_json_safe(seg_row)
             result = await _run(
                 lambda r=seg_row: _supabase.table("session_segments")
                 .upsert(r, on_conflict="session_id,segment_index")
