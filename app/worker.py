@@ -230,13 +230,16 @@ async def download_utterance_wav(task_id: str, filename: str, dest_path: str) ->
 # ── Quality metrics (ported from qualityMetricsService.ts + ffmpegProcessor.ts) ──
 
 def _get_audio_stats_sync(wav_path: str) -> dict:
-    """Blocking: run ffprobe to extract RMS/Peak dB and silence ratio."""
+    """Blocking: run ffmpeg to extract RMS/Peak dB and silence ratio."""
     # RMS and Peak levels via astats filter
     proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-af", "astats=metadata=1:reset=0",
-         "-f", "null", "-i", wav_path],
+        ["ffmpeg", "-v", "info", "-i", wav_path,
+         "-af", "astats=metadata=1:reset=0",
+         "-f", "null", "-"],
         capture_output=True, text=True,
     )
+    if proc.returncode != 0:
+        log.warning("ffmpeg astats failed (rc=%d) for %s: %s", proc.returncode, wav_path, proc.stderr[:200])
     rms_db = -60.0
     peak_db = -60.0
     for line in proc.stderr.splitlines():
@@ -264,10 +267,13 @@ def _get_audio_stats_sync(wav_path: str) -> dict:
 
     # Silence detection
     sil_proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-af", "silencedetect=noise=-40dB:d=0.3",
-         "-f", "null", "-i", wav_path],
+        ["ffmpeg", "-v", "info", "-i", wav_path,
+         "-af", "silencedetect=noise=-40dB:d=0.3",
+         "-f", "null", "-"],
         capture_output=True, text=True,
     )
+    if sil_proc.returncode != 0:
+        log.warning("ffmpeg silencedetect failed (rc=%d) for %s: %s", sil_proc.returncode, wav_path, sil_proc.stderr[:200])
     total_silence = 0.0
     sil_start = None
     for line in sil_proc.stderr.splitlines():
