@@ -20,6 +20,7 @@ from botocore.config import Config
 from supabase import create_client, Client
 
 from app.sanitize_json import sanitize_json_safe
+from app.worker_config import resolve_voice_api_max_wait_sec
 
 # TODO(post-seed): worker_heartbeats 테이블 + 어드민 5분 무응답 알람
 
@@ -31,7 +32,10 @@ STUCK_THRESHOLD_SEC = 600           # 10 min
 RETRY_DELAY_SEC = 1800              # 30 min between retries
 MAX_RETRY_COUNT = 3
 VOICE_API_POLL_INTERVAL_SEC = 1
-VOICE_API_MAX_WAIT_SEC = 300        # 5 min
+# 장통화(>5분) 처리 시 voice-api 응답을 더 기다릴 수 있도록 env 로 조정 가능.
+# 미설정=300(기존 동작 보존), invalid=ValueError 즉시 fail-loud(WORKER_CONCURRENCY 컨벤션).
+# 모듈 로드 시점에 한 번만 읽음(live reload 의도 없음). 상세=app/worker_config.py docstring.
+VOICE_API_MAX_WAIT_SEC = resolve_voice_api_max_wait_sec()
 
 # D4b: worker 는 voice-api 에 pii_intervals_only 만 요청한다(시간범위 메타데이터만 산출,
 # 1kHz 비프 미적용 → 저장 발화 WAV 원본 유지). mask_audio_pii(D5 음향 마스킹)는 요청하지 않음.
