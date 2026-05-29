@@ -20,7 +20,12 @@ from botocore.config import Config
 from supabase import create_client, Client
 
 from app.sanitize_json import sanitize_json_safe
-from app.worker_config import resolve_voice_api_max_wait_sec
+from app.worker_config import (
+    resolve_orphan_cleanup_dry_run,
+    resolve_orphan_cleanup_enabled,
+    resolve_orphan_cleanup_min_ratio,
+    resolve_voice_api_max_wait_sec,
+)
 
 # TODO(post-seed): worker_heartbeats 테이블 + 어드민 5분 무응답 알람
 
@@ -36,6 +41,14 @@ VOICE_API_POLL_INTERVAL_SEC = 1
 # 미설정=300(기존 동작 보존), invalid=ValueError 즉시 fail-loud(WORKER_CONCURRENCY 컨벤션).
 # 모듈 로드 시점에 한 번만 읽음(live reload 의도 없음). 상세=app/worker_config.py docstring.
 VOICE_API_MAX_WAIT_SEC = resolve_voice_api_max_wait_sec()
+
+# Orphan cleanup (PR-1). 둘 다 기본 OFF/DRY → 머지 자체는 운영 영향 0.
+# 설계 정본: scripts/analysis/orphan_cleanup_strategy_20260528.md (uncounted-root).
+# WORKER_ORPHAN_CLEANUP_ENABLED=false 면 persist_results 내 cleanup 호출조차 진입 안 함.
+# true 일 때만 진입하되, DRY_RUN=true 이면 DELETE 없이 로그만. 둘 다 true 일 때만 실 DELETE.
+ORPHAN_CLEANUP_ENABLED = resolve_orphan_cleanup_enabled()
+ORPHAN_CLEANUP_DRY_RUN = resolve_orphan_cleanup_dry_run()
+ORPHAN_CLEANUP_MIN_RATIO = resolve_orphan_cleanup_min_ratio()
 
 # D4b: worker 는 voice-api 에 pii_intervals_only 만 요청한다(시간범위 메타데이터만 산출,
 # 1kHz 비프 미적용 → 저장 발화 WAV 원본 유지). mask_audio_pii(D5 음향 마스킹)는 요청하지 않음.
@@ -359,6 +372,162 @@ def strip_pii_if_curated(
     return row
 
 
+# ── Orphan cleanup (PR-1) ──────────────────────────────────────────────
+# 재처리 시 신규 utterance 수(N) 가 기존 N' 보다 작으면 sequence_order = N+1..N' 가
+# stale orphan 으로 잔존한다(`upsert on_conflict=session_id,sequence_order` 가 N 까지만
+# 덮어쓰기 때문). 본 함수는 그 잔존 행을 식별하고 — 사람이 손댄 흔적(pii_reviewed_at /
+# pii_masked_at / quality_reviewed_by / utterance_human_labels FK)이 없는 경우에 한해
+# — DELETE 한다.
+#
+# 운영 게이트(env, default OFF/DRY):
+#   - WORKER_ORPHAN_CLEANUP_ENABLED=true  → 본 함수 호출 진입
+#   - WORKER_ORPHAN_CLEANUP_DRY_RUN=false → 실 DELETE (default true=로그만)
+#
+# 실패는 항상 fail-closed: try/except 가 모든 예외를 잡아 warning 으로만 emit, 후속
+# persist_results 단계(session_segments)에는 영향 없음.
+#
+# 설계 정본: scripts/analysis/orphan_cleanup_strategy_20260528.md (uncounted-root).
+
+
+async def _cleanup_stale_orphans(
+    session_id: str,
+    new_count: int,
+    run_start_iso: str,
+    dry_run: bool,
+    min_ratio: float,
+) -> None:
+    """sequence_order > new_count 인 stale orphan utterance 정리(env-gated).
+
+    안전 조건(모두 AND):
+      1) session_id 일치 (caller 보장)
+      2) sequence_order > new_count (caller 보장)
+      3) pii_reviewed_at IS NULL                 ← 사람 PII 검수 보존
+      4) pii_masked_at IS NULL                   ← 사람 PII 마스킹 보존
+      5) quality_reviewed_by IS NULL             ← 사람 품질 검수 보존
+      6) updated_at < run_start_iso              ← 본 turn 의 신규 upsert 보호
+      7) NOT EXISTS utterance_human_labels(utterance_id) ← H-loop 라벨 보존
+
+    Sanity guard:
+      - new_count <= 0 → skip(voice-api silent-empty-done 함정 가드)
+      - new_count / (new_count + len(candidates)) < min_ratio → skip + warning
+
+    실패 모드: 모든 예외를 잡아 warning 으로 emit, 후속 단계에 영향 없음.
+    """
+    try:
+        if new_count <= 0:
+            log.info(
+                "[%s] orphan cleanup skip: new_count=%d (silent-empty-done 가드)",
+                session_id, new_count,
+            )
+            return
+
+        # 1. 후보 조회: sequence_order > new_count
+        result = await _run(
+            lambda: _supabase.table("utterances")
+            .select(
+                "id, sequence_order, pii_reviewed_at, pii_masked_at, "
+                "quality_reviewed_by, updated_at, storage_path"
+            )
+            .eq("session_id", session_id)
+            .gt("sequence_order", new_count)
+            .execute()
+        )
+        candidates = result.data or []
+        if not candidates:
+            return  # orphan 없음 — 정상
+
+        # 2. ratio guard: 신규/기존 ratio < min_ratio 면 skip
+        prev_count = new_count + len(candidates)
+        ratio = new_count / prev_count
+        if ratio < min_ratio:
+            log.warning(
+                "[%s] orphan cleanup skip: ratio=%.3f < MIN_RATIO=%.3f "
+                "(new=%d candidates=%d prev=%d) — 수동 검토 필요",
+                session_id, ratio, min_ratio, new_count, len(candidates), prev_count,
+            )
+            return
+
+        # 3. 행-수준 보존 분류 (사람 손댐 흔적 / 본 turn 신규 갱신)
+        safe_ids: list[str] = []
+        preserved_curated = 0
+        preserved_recent = 0
+        for row in candidates:
+            if row.get("pii_reviewed_at") is not None:
+                preserved_curated += 1
+                continue
+            if row.get("pii_masked_at") is not None:
+                preserved_curated += 1
+                continue
+            if row.get("quality_reviewed_by") is not None:
+                preserved_curated += 1
+                continue
+            # updated_at >= run_start_iso 면 본 turn 의 신규 갱신 — 보존(double-safety).
+            updated_at = row.get("updated_at") or ""
+            if updated_at and updated_at >= run_start_iso:
+                preserved_recent += 1
+                continue
+            safe_ids.append(row["id"])
+
+        # 4. utterance_human_labels FK 확인 (라벨 존재 시 보존)
+        if safe_ids:
+            try:
+                labels_result = await _run(
+                    lambda ids=list(safe_ids): _supabase.table("utterance_human_labels")
+                    .select("utterance_id")
+                    .in_("utterance_id", ids)
+                    .execute()
+                )
+                labeled_ids = {
+                    r["utterance_id"] for r in (labels_result.data or [])
+                }
+                if labeled_ids:
+                    safe_ids = [i for i in safe_ids if i not in labeled_ids]
+                    preserved_curated += len(labeled_ids)
+            except Exception as label_err:
+                # 라벨 테이블 조회 실패 → 보수적 skip(라벨 보존 보장 못 함).
+                log.warning(
+                    "[%s] orphan cleanup utterance_human_labels probe 실패 (%s) "
+                    "— 보수적으로 cleanup 보류",
+                    session_id, label_err,
+                )
+                return
+
+        # 5. 가시화 — storage_path 는 S3 sweep 후속 트랙 입력 자료.
+        if safe_ids:
+            safe_set = set(safe_ids)
+            for row in candidates:
+                if row["id"] in safe_set:
+                    log.info(
+                        "[%s] orphan storage_path candidate: %s",
+                        session_id, row.get("storage_path"),
+                    )
+
+        log.info(
+            "[%s] orphan cleanup: new=%d candidates=%d safe=%d "
+            "preserved_curated=%d preserved_recent=%d ratio=%.3f dry_run=%s",
+            session_id, new_count, len(candidates), len(safe_ids),
+            preserved_curated, preserved_recent, ratio, dry_run,
+        )
+
+        # 6. dry_run 이면 DELETE 안 함.
+        if dry_run or not safe_ids:
+            return
+
+        # 7. 실 DELETE — 단일 쿼리(원자적). 결과 카운트 로그.
+        delete_result = await _run(
+            lambda ids=list(safe_ids): _supabase.table("utterances")
+            .delete()
+            .in_("id", ids)
+            .execute()
+        )
+        deleted = len(delete_result.data or [])
+        log.info("[%s] orphan cleanup DELETED %d rows", session_id, deleted)
+
+    except Exception as e:
+        # fail-closed: 어떤 예외도 후속 persist_results 단계로 전파되지 않는다.
+        log.warning("[%s] orphan cleanup failed (격리됨, 후속 단계 진행): %s", session_id, e)
+
+
 async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     """
     For each utterance: download WAV from voice_api → compute quality via ffprobe
@@ -370,6 +539,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     user_id = session["user_id"]
     utterances = job_result.get("utterances", [])
     loop = asyncio.get_running_loop()
+    # orphan cleanup 의 updated_at 보호 경계 — 본 turn 의 어떤 upsert 도 이 시각 이후.
+    run_start_iso = _now_iso()
 
     # ── STAGE 15: session_speakers ────────────────────────────────────────
     speaker_label_to_id: dict[str, str] = {}
@@ -522,6 +693,19 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             .execute()
         )
         upserted += 1
+
+    # ── Orphan cleanup (env-gated, default OFF/DRY) ───────────────────────
+    # 신규 upsert 가 끝난 뒤, sequence_order > upserted 의 잔존 행 정리.
+    # ENABLED=false 면 호출 자체가 일어나지 않음(머지 직후 운영 영향 0).
+    # 상세 = scripts/analysis/orphan_cleanup_strategy_20260528.md (uncounted-root).
+    if ORPHAN_CLEANUP_ENABLED:
+        await _cleanup_stale_orphans(
+            session_id=session_id,
+            new_count=upserted,
+            run_start_iso=run_start_iso,
+            dry_run=ORPHAN_CLEANUP_DRY_RUN,
+            min_ratio=ORPHAN_CLEANUP_MIN_RATIO,
+        )
 
     # ── STAGE 16: session_segments ────────────────────────────────────────
     topic_segments_data = job_result.get("topic_segments", [])
