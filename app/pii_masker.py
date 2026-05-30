@@ -1,6 +1,11 @@
 import re
 from typing import Optional
 
+from app.pii_extended import (
+    detect_extended_spans,
+    resolve_pii_detector_extended_enabled,
+)
+
 
 # 한국 성씨 목록 (상위 빈도)
 KOREAN_SURNAMES = (
@@ -283,6 +288,14 @@ def detect_pii_spans(
                     "matched_text": m.group(0)
                 })
 
+    # 3. PR-B: 한국어 PII 사각지대 보강 룰 5종 (WORKER_PII_DETECTOR_EXTENDED env-gated).
+    #    credential_like / foreign_id_like / payment_like / numeric_sensitive_like /
+    #    korean_name_like_candidate. 기존 PII_PATTERNS 와 중복되는 영역은 mask_pii 의
+    #    non-overlapping 정렬이 안전하게 처리. 기존 detect_pii_spans 시그니처 유지.
+    #    설계: app/pii_extended.py — 메모리 [[project-pii-detector-blind-spot]].
+    if resolve_pii_detector_extended_enabled():
+        spans.extend(detect_extended_spans(text, enable_name_masking=enable_name_masking))
+
     return spans
 
 
@@ -300,6 +313,13 @@ def mask_pii(
     """
     enable_name_masking = _resolve_name_masking(enable_name_masking, grade)
     spans = detect_pii_spans(text, enable_name_masking)
+
+    # PR-B: korean_name_like_candidate 는 detect 만, mask 단계에서는 제외.
+    # 이유: 기존 _SURNAME_PATTERN("이름" 라벨)이 partial 마스킹("홍OO" 등) 정책을
+    # 가지므로 우선 적용. 본 candidate 라벨은 worker.py 가 pii_intervals 에
+    # candidate 메타로 emit (mask_pii 결과 transcript 는 기존 정책 유지).
+    from app.pii_extended import LABEL_KOREAN_NAME_CANDIDATE as _LBL_KN_CAND
+    spans = [s for s in spans if s.get("type") != _LBL_KN_CAND]
 
     # 중첩된 span 처리: 시작 위치 순, 길이 역순으로 정렬
     spans.sort(key=lambda x: (x["char_start"], -(x["char_end"] - x["char_start"])))
