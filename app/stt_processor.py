@@ -717,12 +717,30 @@ def transcribe(
                 type_to_ranges.setdefault(p_type, []).append(
                     {"start": round(r_start, 2), "end": round(r_end, 2)}
                 )
+            existing_types = {item["type"] for item in pii_summary}
             pii_summary = [
                 {**item, "time_ranges": type_to_ranges[item["type"]]}
                 if item["type"] in type_to_ranges
                 else {**item}
                 for item in pii_summary
             ]
+            # PR-B2: type_to_ranges 에 있으나 mask_segments 의 pii_summary 에 없는 type
+            # (PR-B extended detector 의 credential_like / foreign_id_like / payment_like /
+            # numeric_sensitive_like / korean_name_like_candidate) 에 대해 신규 항목 추가.
+            # mask_pii 의 pattern_order 는 PII_PATTERNS + "이름" 만 emit 하므로 extended
+            # type 은 pii_summary 에 미존재 → 본 단계가 없으면 find_pii_word_ranges 가
+            # 시간범위를 산출해도 build_pii_intervals 입력으로 흐르지 않는다 (PR-B2 단절점).
+            # count = time_ranges 길이 (PIIDetectedItem.count >= 1 보장). type 자체에
+            # `_candidate` suffix 가 후보 표지 (worker.build_pii_intervals 무변경, 호출자가
+            # pii_extended.is_candidate_type(piiType) 으로 판별). D4b text_only 정책 보존
+            # (mask_type 은 worker.build_pii_intervals 의 PII_INTERVAL_MASK_TYPE 그대로).
+            for p_type, ranges in type_to_ranges.items():
+                if p_type not in existing_types:
+                    pii_summary.append({
+                        "type": p_type,
+                        "count": len(ranges),
+                        "time_ranges": ranges,
+                    })
 
         # 6. 전체 텍스트
         full_text = " ".join(s["text"] for s in segments)
