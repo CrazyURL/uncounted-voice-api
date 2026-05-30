@@ -61,14 +61,28 @@ def find_pii_word_ranges(
                 # 걸치는 word들의 min start, max end
                 t_start = min(w["start"] for w in timed_words)
                 t_end = max(w["end"] for w in timed_words)
-                
+
                 # 패딩 적용
                 t_start = max(0.0, t_start - pad_sec)
                 t_end = t_end + pad_sec
-                
+
                 pii_time_ranges.append((t_start, t_end, span["type"]))
 
-    return pii_time_ranges
+    # PR-B2: 같은 (start_sec, end_sec, pii_type) 튜플 중복 제거.
+    # 기존 PII_PATTERNS 와 PR-B extended 룰이 동일 char 영역을 같은 type 으로 두 번
+    # emit 하거나, 같은 word 가 여러 span 에 걸쳐 중복 매핑되는 경우 idempotent 보장.
+    # 다른 type 의 시간 overlap (예: 이름 ∩ korean_name_like_candidate) 은 정보적
+    # 중복 아님 — type 별로 별도 emit 유지 (build_pii_intervals 가 piiType 별 행 emit).
+    # 안정 순서 유지: 첫 등장 순서대로.
+    seen: set[tuple[float, float, str]] = set()
+    deduped: list[tuple[float, float, str]] = []
+    for r in pii_time_ranges:
+        key = (round(r[0], 4), round(r[1], 4), r[2])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    return deduped
 
 def mask_audio_ranges(
     audio: np.ndarray, ranges: list[tuple[float, float, str]], sr: int, method: str = "beep"
