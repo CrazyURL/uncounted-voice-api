@@ -351,3 +351,129 @@ class TestFixHangingWords:
         # "아마도"는 SPEAKER_0 발화에 남아야 함
         sp0_texts = [u.transcript_text for u in result if u.speaker_id == "SPEAKER_0"]
         assert any("아마도" in t for t in sp0_texts)
+
+
+
+# ===== PR #22 — None speaker hardening =====
+
+def _word_no_speaker(text: str, start: float, end: float) -> dict:
+    """speaker 키가 아예 없는 word (legacy)."""
+    return {"word": text, "start": start, "end": end}
+
+
+def _word_none_speaker(text: str, start: float, end: float) -> dict:
+    """speaker=None 인 word (Phase 3 overlap / ambiguous 시뮬)."""
+    return {"word": text, "start": start, "end": end, "speaker": None}
+
+
+def _word_str_none_speaker(text: str, start: float, end: float) -> dict:
+    """speaker="None" 문자열 (corruption 패턴)."""
+    return {"word": text, "start": start, "end": end, "speaker": "None"}
+
+
+class TestNoneSpeakerHardening:
+    """speaker=None 또는 "None"/"none" 문자열이 DB 까지 흘러가지 않게 차단."""
+
+    def test_get_speaker_id_returns_none_for_none_value(self):
+        from app.services.utterance_segmenter import _get_speaker_id
+        assert _get_speaker_id({"speaker": None}) is None
+
+    def test_get_speaker_id_returns_none_for_str_None(self):
+        from app.services.utterance_segmenter import _get_speaker_id
+        assert _get_speaker_id({"speaker": "None"}) is None
+        assert _get_speaker_id({"speaker": "none"}) is None
+        assert _get_speaker_id({"speaker": "NONE"}) is None
+        assert _get_speaker_id({"speaker": " None "}) is None
+
+    def test_get_speaker_id_legacy_default_when_key_missing(self):
+        from app.services.utterance_segmenter import _get_speaker_id
+        # legacy: 키 자체 부재 시 default "SPEAKER_00"
+        assert _get_speaker_id({"word": "x"}) == "SPEAKER_00"
+
+    def test_get_speaker_id_passes_through_valid(self):
+        from app.services.utterance_segmenter import _get_speaker_id
+        assert _get_speaker_id({"speaker": "SPEAKER_00"}) == "SPEAKER_00"
+        assert _get_speaker_id({"speaker": "SPEAKER_01"}) == "SPEAKER_01"
+        # speakerId 키도 정상
+        assert _get_speaker_id({"speakerId": "SPEAKER_02"}) == "SPEAKER_02"
+
+    def test_segment_skips_none_speaker_words(self):
+        """Phase 3 의 overlap word (speaker=None) 가 utterance 로 emit 되지 않음."""
+        words = [
+            _word("hello", 0.0, 1.0, "SPEAKER_00"),
+            _word_none_speaker("overlap", 1.1, 1.5),     # skip 되어야 함
+            _word("world", 1.6, 2.5, "SPEAKER_00"),
+        ]
+        result = segment(words, 10.0)
+        # speaker_id 가 None / "None" 인 utterance 0
+        assert all(u.speaker_id and u.speaker_id.lower() != "none" for u in result)
+        # 정상 SPEAKER_00 utterance 존재
+        assert any(u.speaker_id == "SPEAKER_00" for u in result)
+
+    def test_segment_skips_str_None_speaker_words(self):
+        """corruption 패턴 ("None" 문자열) 도 emit 차단."""
+        words = [
+            _word("hello", 0.0, 1.0, "SPEAKER_00"),
+            _word_str_none_speaker("contam", 1.1, 1.5),
+            _word("world", 1.6, 2.5, "SPEAKER_00"),
+        ]
+        result = segment(words, 10.0)
+        for u in result:
+            assert u.speaker_id and u.speaker_id.strip().lower() != "none", (
+                f"corruption 'None' utterance emit: {u}"
+            )
+
+    def test_segment_all_none_returns_empty(self):
+        """모든 word 의 speaker 가 None 이면 빈 utterance 리스트."""
+        words = [
+            _word_none_speaker("a", 0.0, 1.0),
+            _word_none_speaker("b", 1.1, 2.0),
+        ]
+        result = segment(words, 5.0)
+        assert result == []
+
+    def test_segment_all_str_None_returns_empty(self):
+        words = [
+            _word_str_none_speaker("a", 0.0, 1.0),
+            _word_str_none_speaker("b", 1.1, 2.0),
+        ]
+        result = segment(words, 5.0)
+        assert result == []
+
+    def test_segment_mixed_none_and_valid_keeps_only_valid(self):
+        """None / "None" / 유효 가 섞여도 유효만 utterance."""
+        words = [
+            _word_none_speaker("overlap", 0.0, 0.4),
+            _word("hello", 0.5, 1.5, "SPEAKER_00"),
+            _word("there", 1.6, 2.5, "SPEAKER_00"),
+            _word_str_none_speaker("ambig", 2.6, 3.0),
+            _word("bye", 3.1, 4.0, "SPEAKER_01"),
+        ]
+        result = segment(words, 10.0)
+        speakers = [u.speaker_id for u in result]
+        assert "SPEAKER_00" in speakers
+        assert "SPEAKER_01" in speakers
+        # corruption 0
+        for u in result:
+            assert u.speaker_id and u.speaker_id.strip().lower() != "none"
+
+    def test_segment_empty_words_returns_empty(self):
+        assert segment([], 10.0) == []
+
+    def test_split_by_boundaries_empty_safe(self):
+        from app.services.utterance_segmenter import _split_by_boundaries
+        # 빈 입력 안전 처리 (사전 필터 후 호출 시나리오)
+        assert _split_by_boundaries([]) == []
+
+    def test_speaker_change_still_splits_after_filter(self):
+        """None word 가 사전 필터되어도 valid word 사이 speaker 변화는 분할 유지."""
+        words = [
+            _word("a", 0.0, 1.0, "SPEAKER_00"),
+            _word_none_speaker("noise", 1.1, 1.3),
+            _word("b", 1.4, 2.0, "SPEAKER_01"),
+        ]
+        result = segment(words, 5.0)
+        # SPEAKER_00 와 SPEAKER_01 두 utterance 분할 보존
+        speakers = [u.speaker_id for u in result]
+        assert "SPEAKER_00" in speakers
+        assert "SPEAKER_01" in speakers

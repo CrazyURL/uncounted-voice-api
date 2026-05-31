@@ -18,15 +18,33 @@ class UtteranceBoundary:
 
 
 def segment(words: list[dict], total_duration: float) -> list[UtteranceBoundary]:
-    """Split words into utterance boundaries by speaker change and silence gaps."""
+    """Split words into utterance boundaries by speaker change and silence gaps.
+
+    None speaker hardening:
+      - 입구: _get_speaker_id 가 None 을 반환하는 word 사전 필터
+        (Phase 3 의 overlap / ambiguous / tolerance miss word 차단)
+      - 출구: speaker_id 가 falsy 또는 정규화 후 "none" 인 utterance 제외
+        (defense-in-depth — _RawUtterance 가 다른 경로로 None 을 가져도 emit 차단)
+    """
     if not words:
         return []
 
-    raw = _split_by_boundaries(words)
+    # 입구 가드 — speaker=None / "None" / "none" word 사전 필터
+    valid_words = [w for w in words if _get_speaker_id(w) is not None]
+    if not valid_words:
+        return []
+
+    raw = _split_by_boundaries(valid_words)
     fixed = _fix_hanging_words(raw)
     merged = _merge_short_utterances(fixed)
     split = _split_long_utterances(merged)
-    return _apply_padding(split, total_duration)
+    boundaries = _apply_padding(split, total_duration)
+
+    # 출구 가드 — speaker_id falsy 또는 "none" 정규화 시 제외
+    return [
+        b for b in boundaries
+        if b.speaker_id and str(b.speaker_id).strip().lower() != "none"
+    ]
 
 
 # -- Internal types --
@@ -49,6 +67,10 @@ class _RawUtterance:
 # -- Step 1 & 2: Split by speaker change + silence --
 
 def _split_by_boundaries(words: list[dict]) -> list[_RawUtterance]:
+    # segment() 입구 가드가 이미 None speaker word 를 사전 필터하지만, 직접 호출 경로
+    # (단위 테스트 등) 에서도 빈 입력 안전.
+    if not words:
+        return []
     utterances: list[_RawUtterance] = []
     current_words: list[dict] = [words[0]]
     current_speaker = _get_speaker_id(words[0])
@@ -255,9 +277,19 @@ def _apply_padding(utterances: list[_RawUtterance], total_duration: float) -> li
 
 # -- Utilities --
 
-def _get_speaker_id(word: dict) -> str:
-    # SPEAKER_NN 패턴 (자릿수 패딩) 유지 — 다른 코드 경로와 일관성
-    return str(word.get("speakerId", word.get("speaker", "SPEAKER_00")))
+def _get_speaker_id(word: dict) -> str | None:
+    """word 의 speaker id 를 추출. None 또는 "None"/"none" 문자열 입력은 None 반환.
+
+    Phase 3 (raw pyannote direct mapping) 의 word.speaker=None (overlap / ambiguous)
+    또는 다른 경로에서 "None" 문자열이 들어와도 DB 까지 corruption 이 흘러가지 않도록
+    소스 단에서 정규화. None 반환 시 호출자가 word 자체를 skip 한다.
+    """
+    raw = word.get("speakerId", word.get("speaker", "SPEAKER_00"))
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() == "none":
+        return None
+    return str(raw)
 
 
 def _to_float(val) -> float:
