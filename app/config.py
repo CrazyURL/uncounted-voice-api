@@ -7,12 +7,35 @@ PORT = int(os.environ.get("PORT", "8001" if ENV == "dev" else "8000"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 WORKERS = int(os.environ.get("WORKERS", "1"))
 
-# WhisperX 모델 설정
-MODEL_SIZE = os.environ.get("MODEL_SIZE", "large-v3")
+# WhisperX 모델 설정 — STT Pipeline preset 기반
+# v2-largev3-int8 (default) : large-v3 + int8 + batch_size=4 (RTX 4060 8GB 안전 상한)
+# v1-turbo-frozen (legacy)  : large-v3-turbo + float16 + batch_size=4
+# MODEL_SIZE / COMPUTE_TYPE / BATCH_SIZE env 명시 시 그 값이 우선 (운영자 override 존중).
+PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "v2-largev3-int8")
+
+_PIPELINE_PRESETS = {
+    "v2-largev3-int8": {
+        "model_size": "large-v3",
+        "compute_type": "int8",
+        "batch_size": 4,
+    },
+    "v1-turbo-frozen": {
+        "model_size": "large-v3-turbo",
+        "compute_type": "float16",
+        "batch_size": 4,
+    },
+}
+_preset = _PIPELINE_PRESETS.get(PIPELINE_VERSION, _PIPELINE_PRESETS["v2-largev3-int8"])
+
+MODEL_SIZE = os.environ.get("MODEL_SIZE", _preset["model_size"])
 DEVICE = os.environ.get("DEVICE", "cuda")
-COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16")
+COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", _preset["compute_type"])
 LANGUAGE = os.environ.get("LANGUAGE", "ko")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", str(_preset["batch_size"])))
+
+# OOM 가드 — _model.transcribe OOM 시 batch_size 절반씩 후퇴 (예: 4 → 2 → 1)
+BATCH_SIZE_MIN = int(os.environ.get("BATCH_SIZE_MIN", "1"))
+BATCH_OOM_RETRY_ENABLED = os.environ.get("BATCH_OOM_RETRY_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # HuggingFace 토큰 (화자분리용)
 HF_TOKEN = os.environ.get("HF_TOKEN", None)

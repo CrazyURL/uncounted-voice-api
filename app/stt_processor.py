@@ -318,6 +318,36 @@ def _apply_reclustering(
     return result
 
 
+def _transcribe_with_oom_guard(audio, task_id: str) -> dict:
+    """OOM 시 batch_size 를 절반 단계로 후퇴 (예: 4 → 2 → 1) 후 retry.
+
+    RTX 4060 8GB 등 VRAM 압박 환경에서 large-v3 + alignment + pyannote 동시 로딩 시
+    batch_size 가 메모리 피크 주범. 한 번에 OOM 나도 cache 비우고 작은 batch 로 재시도.
+
+    config.BATCH_OOM_RETRY_ENABLED=false 면 첫 OOM 에 그대로 raise (rollback 안전망).
+    """
+    current = config.BATCH_SIZE
+    min_bs = max(1, config.BATCH_SIZE_MIN)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _model.transcribe(audio, batch_size=current)
+        except torch.cuda.OutOfMemoryError as oom:
+            torch.cuda.empty_cache()
+            logger.warning(
+                "[%s] OOM at batch_size=%d (attempt=%d): %s",
+                task_id, current, attempt, oom,
+            )
+            if not config.BATCH_OOM_RETRY_ENABLED or current <= min_bs:
+                raise
+            next_bs = max(min_bs, current // 2)
+            if next_bs >= current:
+                raise
+            current = next_bs
+            logger.info("[%s] OOM fallback → batch_size=%d", task_id, current)
+
+
 def load_models():
     """WhisperX 모델을 전역으로 로딩한다."""
     global _model, _align_model, _align_metadata, _diarize_model
@@ -396,7 +426,7 @@ def _transcribe_chunk(
     job_store.update_gpu_acquired(task_id)
     logger.info("[%s] GPU lock 획득 | lock_wait_ms=%d", task_id, lock_wait_ms)
     try:
-        result = _model.transcribe(audio, batch_size=config.BATCH_SIZE)
+        result = _transcribe_with_oom_guard(audio, task_id)
         logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
 
         try:
@@ -645,7 +675,7 @@ def transcribe(
             job_store.update_gpu_acquired(task_id)
             logger.info("[%s] GPU lock 획득 | lock_wait_ms=%d", task_id, lock_wait_ms)
             try:
-                result = _model.transcribe(audio, batch_size=config.BATCH_SIZE)
+                result = _transcribe_with_oom_guard(audio, task_id)
                 logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
 
                 try:
