@@ -318,6 +318,29 @@ def _apply_reclustering(
     return result
 
 
+def _do_speaker_assign(diarize_segments, result, task_id: str):
+    """SPEAKER_MAPPING_MODE 분기 — raw_direct (Phase 3) | whisperx (legacy)."""
+    mode = config.SPEAKER_MAPPING_MODE
+    if mode == "raw_direct":
+        # lazy import (whisperx 와 별개)
+        from app.speaker_mapping import assign_speakers
+        return assign_speakers(
+            diarize_segments,
+            result,
+            tolerance_default_ms=config.SPEAKER_MAP_TOLERANCE_DEFAULT_MS,
+            tolerance_max_ms=config.SPEAKER_MAP_TOLERANCE_MAX_MS,
+            backchannel_dur_max=config.SPEAKER_MAP_BACKCHANNEL_DUR_MAX,
+            overlap_min_s=config.SPEAKER_MAP_OVERLAP_MIN_SEC,
+        )
+    if mode == "whisperx":
+        return whisperx.assign_word_speakers(diarize_segments, result)
+    logger.warning(
+        "[%s] unknown SPEAKER_MAPPING_MODE=%r → fallback to whisperx",
+        task_id, mode,
+    )
+    return whisperx.assign_word_speakers(diarize_segments, result)
+
+
 def _transcribe_with_oom_guard(audio, task_id: str) -> dict:
     """OOM 시 batch_size 를 절반 단계로 후퇴 (예: 4 → 2 → 1) 후 retry.
 
@@ -441,7 +464,7 @@ def _transcribe_chunk(
         if enable_diarize and _diarize_model is not None:
             try:
                 diarize_segments = _diarize_model(audio, **diarization_options)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
+                result = _do_speaker_assign(diarize_segments, result, task_id)
                 logger.info("[%s] 화자분리 완료", task_id)
 
                 # Phase 7: WeSpeaker reclustering (chunked path)
@@ -690,7 +713,7 @@ def transcribe(
                 try:
                     if enable_diarize and _diarize_model is not None:
                         diarize_segments = _diarize_model(audio, **diarization_options)
-                        result = whisperx.assign_word_speakers(diarize_segments, result)
+                        result = _do_speaker_assign(diarize_segments, result, task_id)
                         logger.info("[%s] 화자분리 완료", task_id)
 
                         # Phase 7: WeSpeaker reclustering (non-chunked path)
