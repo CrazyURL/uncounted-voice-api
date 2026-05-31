@@ -150,3 +150,16 @@ CHUNK_THRESHOLD_SEC = int(os.environ.get("CHUNK_THRESHOLD_SEC", "3600"))  # 이 
 CHUNK_SILENCE_DB = float(os.environ.get("CHUNK_SILENCE_DB", "-30"))       # 무음 감지 임계값 (dB)
 CHUNK_SILENCE_DUR = float(os.environ.get("CHUNK_SILENCE_DUR", "0.3"))     # 최소 무음 길이 (초)
 CHUNK_MARGIN_SEC = int(os.environ.get("CHUNK_MARGIN_SEC", "300"))         # 분할 지점 탐색 범위 (±5분)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 3 — Raw Pyannote Direct Speaker Mapping
+# whisperx.assign_word_speakers 가 흡수하던 짧은 back-channel / overlap 을 우회.
+# raw_direct  : app.speaker_mapping.assign_speakers (Phase 3, env-gated activation)
+# whisperx    : 기존 whisperx.assign_word_speakers (default, legacy 안전망 — 코드 머지 직후 자동 활성화 차단)
+# ─────────────────────────────────────────────────────────────
+SPEAKER_MAPPING_MODE = os.environ.get("SPEAKER_MAPPING_MODE", "whisperx")
+SPEAKER_MAP_TOLERANCE_DEFAULT_MS = int(os.environ.get("SPEAKER_MAP_TOLERANCE_DEFAULT_MS", "150"))
+SPEAKER_MAP_TOLERANCE_MAX_MS = int(os.environ.get("SPEAKER_MAP_TOLERANCE_MAX_MS", "300"))
+SPEAKER_MAP_BACKCHANNEL_DUR_MAX = float(os.environ.get("SPEAKER_MAP_BACKCHANNEL_DUR_MAX", "0.7"))
+SPEAKER_MAP_OVERLAP_MIN_SEC = float(os.environ.get("SPEAKER_MAP_OVERLAP_MIN_SEC", "0.05"))
