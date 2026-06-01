@@ -157,13 +157,34 @@ def _detect_gender_and_voice_age(
 # 호칭어 관계 감지
 # ---------------------------------------------------------------------------
 
-def _detect_relation(texts: list[str]) -> str | None:
-    """pre-mask 텍스트에서 호칭어를 탐지해 관계 레이블을 반환한다."""
+def _detect_relation_by_salutation(texts: list[str]) -> str | None:
+    """pre-mask 텍스트에서 호칭어를 탐지해 관계 레이블을 반환한다(정규식 휴리스틱)."""
     combined = " ".join(texts)
     for pattern, relation in _SALUTATION_RULES:
         if pattern.search(combined):
             return relation
     return None
+
+
+def _detect_relation(
+    other_texts: list[str],
+    all_texts_by_speaker: dict[str, list[str]] | None = None,
+) -> str | None:
+    """관계 추정. LLM(Ollama) 우선 → 실패/게이트OFF 시 호칭 정규식 fallback.
+
+    LLM 은 양쪽 화자 대화 전체(all_texts_by_speaker)를 맥락으로 사용한다. 호칭
+    정규식은 한쪽(other) 텍스트만으로도 동작하던 기존 동작을 그대로 보존한다.
+    RELATION_INFER_OLLAMA_ENABLED=false(기본)면 LLM 경로는 건너뛰어 무회귀.
+    """
+    from app.services import relation_inference
+
+    if relation_inference.is_enabled() and all_texts_by_speaker:
+        dialogue = relation_inference.build_dialogue(all_texts_by_speaker)
+        result = relation_inference.infer(dialogue)
+        if result is not None:
+            return result[0]
+    # fallback — 기존 호칭 정규식 (other 텍스트 기반)
+    return _detect_relation_by_salutation(other_texts)
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +301,11 @@ def analyze_speakers(
         gender, voice_age = _detect_gender_and_voice_age(chunk, sample_rate)
 
         pre_texts = pre_mask_texts_by_speaker.get(lbl, [])
-        relation = _detect_relation(pre_texts) if role == "other" else None
+        # 관계 추정은 other 화자에만 부여. LLM 경로는 양쪽 대화 전체를 맥락으로 사용.
+        relation = (
+            _detect_relation(pre_texts, pre_mask_texts_by_speaker)
+            if role == "other" else None
+        )
         speech_age, speech_age_ver = _detect_speech_age(pre_texts) if pre_texts else (None, None)
 
         results[lbl] = SpeakerAnalysisResult(
