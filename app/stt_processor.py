@@ -182,7 +182,15 @@ def _compute_audio_stats(
 
 
 def _clean_segments(raw_segments: list[dict]) -> list[dict]:
-    """WhisperX 결과 세그먼트를 정리한다 (word 데이터 보존)."""
+    """WhisperX 결과 세그먼트를 정리한다 (word 데이터 보존).
+
+    raw_direct(SPEAKER_MAPPING_MODE=raw_direct) 가 부착하는 메타는 있을 때만 보존한다
+    (whisperx legacy 경로에는 없으므로 추가되지 않음 → 기존 동작 무변경):
+      - word: speaker_source (라벨 출처: exact/overlap/tolerance/backchannel/ambiguous)
+      - segment: source_distribution / overlap_ranges / parent_segment_text
+    speaker_id 산정 로직은 word.speaker 만 사용하므로(_get_speaker_id) 메타 보존은
+    발화 분리/화자 배정에 영향이 없고, transcript_words JSONB 추가 키로만 흐른다.
+    """
     segments = []
     for seg in raw_segments:
         segment = {
@@ -192,19 +200,36 @@ def _clean_segments(raw_segments: list[dict]) -> list[dict]:
         }
         if "speaker" in seg:
             segment["speaker"] = seg["speaker"]
+        # raw_direct segment 메타 — 있을 때만 보존 (legacy whisperx 에는 부재)
+        for meta_key in ("source_distribution", "overlap_ranges", "parent_segment_text"):
+            if meta_key in seg:
+                segment[meta_key] = seg[meta_key]
         if "words" in seg:
             segment["words"] = [
-                {
-                    "word": w.get("word", ""),
-                    "start": round(w.get("start", 0), 2),
-                    "end": round(w.get("end", 0), 2),
-                    "speaker": w.get("speaker"),
-                }
+                _clean_word(w)
                 for w in seg["words"]
                 if w.get("start") is not None and w.get("end") is not None
             ]
         segments.append(segment)
     return segments
+
+
+def _clean_word(w: dict) -> dict:
+    """word dict 정리. raw_direct 의 speaker_source 메타는 있을 때만 보존한다.
+
+    legacy whisperx word 에는 speaker_source 키가 없어 추가되지 않으므로 기존 schema
+    (word/start/end/speaker) 와 호환. speaker 가 None 이어도 문자열 "None" 으로
+    바꾸지 않는다(_get_speaker_id 가 None 을 그대로 받아 필터하도록 유지 — PR #22).
+    """
+    cleaned = {
+        "word": w.get("word", ""),
+        "start": round(w.get("start", 0), 2),
+        "end": round(w.get("end", 0), 2),
+        "speaker": w.get("speaker"),
+    }
+    if "speaker_source" in w:
+        cleaned["speaker_source"] = w["speaker_source"]
+    return cleaned
 
 
 def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
@@ -818,12 +843,16 @@ def transcribe(
                 for s in segments:
                     if s.get("words"):
                         for w in s["words"]:
-                            all_words.append({
+                            flat = {
                                 "word": w.get("word", ""),
                                 "start": w.get("start", s["start"]),
                                 "end": w.get("end", s["end"]),
                                 "speaker": w.get("speaker", s.get("speaker")),
-                            })
+                            }
+                            # raw_direct word 메타 보존 (있을 때만; legacy 에는 부재)
+                            if "speaker_source" in w:
+                                flat["speaker_source"] = w["speaker_source"]
+                            all_words.append(flat)
                     else:
                         all_words.append({
                             "word": s.get("text", ""),
