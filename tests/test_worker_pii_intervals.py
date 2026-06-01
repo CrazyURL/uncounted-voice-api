@@ -34,6 +34,30 @@ def test_submit_params_add_only_pii_intervals_only():
         assert k in params
 
 
+def test_submit_params_enables_name_masking():
+    # 한국어 이름 마스킹(텍스트). voice-api enable_name_masking 기본값 false 이므로
+    # worker 가 명시 전달해야 성씨+이름 패턴이 감지된다(누락 시 transcript 평문 노출).
+    params = worker.build_submit_params()
+    assert params["enable_name_masking"] == "true"
+
+
+def test_submit_params_name_masking_is_text_only_not_audio_beep():
+    # 텍스트 마스킹과 오디오 비프(D5)는 분리. 이름 텍스트 마스킹을 켜도 오디오 변형 게이트
+    # (mask_audio_pii / mask_audio_names)는 켜지 않는다(저장 WAV 원본 provenance 유지).
+    params = worker.build_submit_params()
+    assert params["enable_name_masking"] == "true"
+    assert "mask_audio_names" not in params
+    assert "mask_audio_pii" not in params
+
+
+def test_submit_params_regression_missing_name_masking_fails():
+    # 회귀 가드: enable_name_masking 키가 빠지거나 "true" 가 아니면 실패.
+    # 세션 93c28f57 재처리에서 이름 PII 0 건이 된 배선 결함 재발 방지.
+    params = worker.build_submit_params()
+    assert "enable_name_masking" in params, "enable_name_masking 누락 — 이름 PII 미감지 회귀"
+    assert params["enable_name_masking"] == "true"
+
+
 # ── build_pii_intervals: maskType + overlap ─────────────────────────────────
 
 def test_build_pii_intervals_masktype_text_only_and_no_original():

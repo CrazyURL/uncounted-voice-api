@@ -182,6 +182,10 @@ def build_submit_params() -> dict:
         "split_by_utterance": "true",
         "split_by_speaker": "true",
         "mask_pii": "true",
+        # 한국어 이름 마스킹(텍스트). voice-api 의 enable_name_masking 기본값은 false 라
+        # 명시하지 않으면 성씨+이름 패턴이 감지되지 않는다(transcript 평문 노출). D4b 텍스트
+        # 마스킹 경로이며 오디오는 변형하지 않는다(mask_audio_names=D5 비프와 무관).
+        "enable_name_masking": "true",
         "denoise": "true",
         # PII 시간범위 메타데이터만 산출(오디오 미변형). 저장 발화 WAV 원본 유지.
         "pii_intervals_only": "true",
