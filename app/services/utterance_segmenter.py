@@ -34,10 +34,16 @@ def segment(words: list[dict], total_duration: float) -> list[UtteranceBoundary]
     if not valid_words:
         return []
 
-    raw = _split_by_boundaries(valid_words)
-    fixed = _fix_hanging_words(raw)
-    merged = _merge_short_utterances(fixed)
-    split = _split_long_utterances(merged)
+    if config.DYNAMIC_SEGMENT_ENABLED:
+        # 동적 모드: 화자 변화에서만 분리(침묵 무시) + 장기발화 동적 윈도우(15/30s) 분할.
+        # 침묵 기반 분할·short merge·midpoint 분할을 쓰지 않는다(각 화자 턴=화자순수 발화).
+        raw = _split_by_speaker_only(valid_words)
+        split = _dynamic_window_split(raw)
+    else:
+        raw = _split_by_boundaries(valid_words)
+        fixed = _fix_hanging_words(raw)
+        merged = _merge_short_utterances(fixed)
+        split = _split_long_utterances(merged)
     boundaries = _apply_padding(split, total_duration)
 
     # 출구 가드 — speaker_id falsy 또는 "none" 정규화 시 제외
@@ -93,6 +99,73 @@ def _split_by_boundaries(words: list[dict]) -> list[_RawUtterance]:
         utterances.append(_RawUtterance(current_speaker, current_words))
 
     return utterances
+
+
+# -- Dynamic mode (env-gated): split by speaker change only + dynamic window --
+
+def _split_by_speaker_only(words: list[dict]) -> list[_RawUtterance]:
+    """화자 변화에서만 분리(침묵 무시). 같은 화자는 침묵이 있어도 하나의 발화로 유지."""
+    if not words:
+        return []
+    utterances: list[_RawUtterance] = []
+    current_words: list[dict] = [words[0]]
+    current_speaker = _get_speaker_id(words[0])
+    for i in range(1, len(words)):
+        speaker = _get_speaker_id(words[i])
+        if speaker != current_speaker:
+            utterances.append(_RawUtterance(current_speaker, current_words))
+            current_words = []
+            current_speaker = speaker
+        current_words.append(words[i])
+    if current_words:
+        utterances.append(_RawUtterance(current_speaker, current_words))
+    return utterances
+
+
+def _dynamic_window_split(utterances: list[_RawUtterance]) -> list[_RawUtterance]:
+    """각 (화자순수) 발화를 동적 윈도우로 분할(장기 발화만 영향)."""
+    result: list[_RawUtterance] = []
+    for u in utterances:
+        result.extend(_split_one_dynamic(u))
+    return result
+
+
+def _split_one_dynamic(u: _RawUtterance) -> list[_RawUtterance]:
+    """SOFT(15s) 진입 후 문장종결(.?!) 또는 침묵 GAP(0.4s)에서 분할, 못 찾으면 HARD(30s) 강제.
+
+    "딱 자르지 않고 그 즈음 문장이 끝날 때" — 단어 타임스탬프로 soft-guard 윈도우 구현.
+    """
+    ws = u.words
+    if len(ws) < 2:
+        return [u]
+    soft = config.DYNAMIC_SEGMENT_SOFT_SEC
+    hard = config.DYNAMIC_SEGMENT_HARD_SEC
+    gap_thr = config.DYNAMIC_SEGMENT_GAP_SEC
+
+    out: list[_RawUtterance] = []
+    cur: list[dict] = []
+    run_start = _to_float(ws[0].get("start"))
+    for i, w in enumerate(ws):
+        w_end = _to_float(w.get("end"))
+        # 하드 실링: 이 단어를 넣으면 HARD(30s) 초과 + 이미 쌓인 게 있으면 이 단어 '앞'에서 강제 분할
+        # (스펙: 30초 직전 단어 경계에서 슬라이싱 → chunk 는 항상 30s 미만 유지).
+        if cur and (w_end - run_start) >= hard:
+            out.append(_RawUtterance(u.speaker_id, cur))
+            cur = []
+            run_start = _to_float(w.get("start"))
+        cur.append(w)
+        # 소프트 가드: SOFT(15s) 진입 후 문장종결 또는 침묵 GAP 에서 자연 분할
+        elapsed = w_end - run_start
+        nxt_gap = (_to_float(ws[i + 1].get("start")) - w_end) if i + 1 < len(ws) else 999.0
+        text = (w.get("word") or w.get("text") or "").strip()
+        ends_sentence = bool(text) and text[-1] in (".", "?", "!")
+        if elapsed >= soft and (ends_sentence or nxt_gap >= gap_thr):
+            out.append(_RawUtterance(u.speaker_id, cur))
+            cur = []
+            run_start = _to_float(ws[i + 1].get("start")) if i + 1 < len(ws) else w_end
+    if cur:
+        out.append(_RawUtterance(u.speaker_id, cur))
+    return out
 
 
 # -- Step 2: Fix hanging words --

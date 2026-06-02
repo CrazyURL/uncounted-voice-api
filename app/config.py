@@ -163,3 +163,33 @@ SPEAKER_MAP_TOLERANCE_DEFAULT_MS = int(os.environ.get("SPEAKER_MAP_TOLERANCE_DEF
 SPEAKER_MAP_TOLERANCE_MAX_MS = int(os.environ.get("SPEAKER_MAP_TOLERANCE_MAX_MS", "300"))
 SPEAKER_MAP_BACKCHANNEL_DUR_MAX = float(os.environ.get("SPEAKER_MAP_BACKCHANNEL_DUR_MAX", "0.7"))
 SPEAKER_MAP_OVERLAP_MIN_SEC = float(os.environ.get("SPEAKER_MAP_OVERLAP_MIN_SEC", "0.05"))
+
+# ─────────────────────────────────────────────────────────────
+# Task 5 — Cross-talk (overlap) detection / flagging (env-gated, default OFF)
+# pyannote overlap-aware annotation(get_overlap)으로 동시발화 구간을 탐지해
+# utterance 단위 메타(is_overlapping/count/total/ratio/intervals)로 적재.
+# 음원 분리 아님(정합성 보존). 켜기 전 카나리 필수.
+# 컷오프 0.2s: 0.05s는 0.02~0.08s 노이즈 블립 오인(세션 f5414ac6 실측), 0.2s가
+# 노이즈 제거하며 실제 중첩시간 ~92% 보존.
+# ─────────────────────────────────────────────────────────────
+OVERLAP_DETECTION_ENABLED = os.environ.get("OVERLAP_DETECTION_ENABLED", "false").lower() in ("true", "1", "yes")
+OVERLAP_CUTOFF_SEC = float(os.environ.get("OVERLAP_CUTOFF_SEC", "0.2"))
+
+# ─────────────────────────────────────────────────────────────
+# Task 8 — Data lineage / provenance audit (env-gated, default OFF)
+# 세션 처리 run마다 lineage_runs 1건 기록(파이프SHA·모델버전·게이트상태) +
+# utterances.latest_lineage_run_id 배선. forward-only. migration 20260603 선적용 필수.
+# ─────────────────────────────────────────────────────────────
+LINEAGE_TRACKING_ENABLED = os.environ.get("LINEAGE_TRACKING_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# ─────────────────────────────────────────────────────────────
+# Task 5 — Dynamic window segmentation (env-gated, default OFF)
+# 발화 경계 = 화자 변화에서만(침묵 무시, 같은 화자 연속 유지). 단 장기 발화는
+# 동적 윈도우로 분할: SOFT(15s) 진입 → 문장종결(.?!) 또는 침묵 GAP(0.4s) 즉시 분할
+# → 못 찾으면 HARD(30s) 직전 단어경계 강제. STT 30s 어텐션 한계·바이어 단문선호 대응.
+# 켜면 기존 silence-gap 분할/midpoint 분할 대신 이 모드 사용. 켜기 전 카나리 필수.
+# ─────────────────────────────────────────────────────────────
+DYNAMIC_SEGMENT_ENABLED = os.environ.get("VOICE_DYNAMIC_SEGMENT_ENABLED", "false").lower() in ("true", "1", "yes")
+DYNAMIC_SEGMENT_SOFT_SEC = float(os.environ.get("DYNAMIC_SEGMENT_SOFT_SEC", "15.0"))
+DYNAMIC_SEGMENT_HARD_SEC = float(os.environ.get("DYNAMIC_SEGMENT_HARD_SEC", "30.0"))
+DYNAMIC_SEGMENT_GAP_SEC = float(os.environ.get("DYNAMIC_SEGMENT_GAP_SEC", "0.4"))
