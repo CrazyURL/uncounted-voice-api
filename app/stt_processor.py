@@ -343,6 +343,61 @@ def _apply_reclustering(
     return result
 
 
+def _intro_speaker_embeddings(
+    audio: "np.ndarray", sample_rate: int, result: dict, window_sec: float,
+) -> dict[str, list[float]]:
+    """도입부 윈도우 내 pyannote 화자별 대표 임베딩 (하이브리드 코사인 ID매핑용).
+
+    각 화자의 도입부(0~window_sec) 최장 segment 로 WeSpeaker 임베딩 추출.
+    실패/짧음은 건너뛴다(빈 dict 면 hybrid 가 overlap 백업으로 위임).
+    """
+    global _speaker_embedding_model
+    if _speaker_embedding_model is None:
+        _speaker_embedding_model = SpeakerEmbeddingModel()
+    # 화자별 도입부 최장 구간
+    longest: dict[str, tuple[float, float]] = {}
+    for seg in result.get("segments", []):
+        spk = seg.get("speaker")
+        s, e = seg.get("start"), seg.get("end")
+        if not spk or s is None or e is None or float(s) >= window_sec:
+            continue
+        e = min(float(e), window_sec)
+        if spk not in longest or (e - float(s)) > (longest[spk][1] - longest[spk][0]):
+            longest[spk] = (float(s), e)
+    from app.services.speaker_embedding import EmbeddingUnavailable
+    embs: dict[str, list[float]] = {}
+    for spk, (s, e) in longest.items():
+        if e - s < 0.7:  # 임베딩 최소길이 — 중심확장
+            c = (s + e) / 2.0
+            s, e = max(0.0, c - 0.35), c + 0.35
+        seg_audio = audio[int(s * sample_rate):int(e * sample_rate)]
+        emb = _speaker_embedding_model.extract_embedding(seg_audio, sample_rate)
+        if not isinstance(emb, EmbeddingUnavailable):
+            embs[spk] = emb.tolist()
+    return embs
+
+
+def _maybe_apply_hybrid_intro(
+    audio: "np.ndarray", sample_rate: int, result: dict, file_path, task_id: str,
+) -> dict:
+    """도입부 하이브리드 재분리 hook (env-gated, non-chunked).
+
+    게이트 OFF/NeMo 미응답/매핑 실패 시 result 무변경(무중단 fallback).
+    """
+    try:
+        from app.services import hybrid_diarization
+        if not hybrid_diarization.is_enabled():
+            return result
+        win = hybrid_diarization._window_sec()
+        intro_embs = _intro_speaker_embeddings(audio, sample_rate, result, win)
+        return hybrid_diarization.apply_hybrid_intro(
+            result, str(file_path), pyannote_embeddings=intro_embs, window_sec=win,
+        )
+    except Exception as exc:  # noqa: BLE001 — 하이브리드 실패가 STT 전체를 막지 않도록
+        logger.warning("[%s] 하이브리드 도입부 재분리 실패 — 원본 유지: %s", task_id, exc)
+        return result
+
+
 def _do_speaker_assign(diarize_segments, result, task_id: str):
     """SPEAKER_MAPPING_MODE 분기 — raw_direct (Phase 3) | whisperx (legacy)."""
     mode = config.SPEAKER_MAPPING_MODE
@@ -743,6 +798,11 @@ def transcribe(
 
                         # Phase 7: WeSpeaker reclustering (non-chunked path)
                         result = _apply_reclustering(audio, config.SAMPLE_RATE, result, task_id)
+
+                        # 하이브리드 도입부 재분리(env-gated, non-chunked). pyannote 가
+                        # 통화 도입부 짧은 turn 을 단일화자로 뭉치는 문제를 NeMo MSDD 로
+                        # 보정. 게이트 OFF/서비스 미응답 시 result 무변경(무중단).
+                        result = _maybe_apply_hybrid_intro(audio, config.SAMPLE_RATE, result, file_path, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
