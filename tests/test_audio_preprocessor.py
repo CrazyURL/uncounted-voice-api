@@ -515,3 +515,143 @@ class TestGainPipelineIntegration:
         rms_30 = float(np.sqrt(np.mean(result_30 ** 2)))
         rms_10 = float(np.sqrt(np.mean(result_10 ** 2)))
         assert rms_30 > rms_10
+
+
+# ---------------------------------------------------------------------------
+# ⑤ Loudness Normalization (LUFS) — 2026-06-02
+# ---------------------------------------------------------------------------
+
+pytest.importorskip("pyloudnorm")
+
+from app.services import audio_preprocessor as _ap  # noqa: E402
+from app.services.audio_preprocessor import (  # noqa: E402
+    measure_integrated_lufs,
+    normalize_loudness_call,
+    loudness_gated_local_gain,
+)
+from app import config as _cfg  # noqa: E402
+
+
+class TestMeasureLufs:
+    def test_short_clip_returns_none(self):
+        # < 0.4s → pyloudnorm 최소블록 미달 → None
+        assert measure_integrated_lufs(_sine(440, 0.2), SR) is None
+
+    def test_silence_returns_none(self):
+        assert measure_integrated_lufs(_silence(2.0), SR) is None
+
+    def test_louder_has_higher_lufs(self):
+        quiet = measure_integrated_lufs(_sine(440, 2.0) * 0.05, SR)
+        loud = measure_integrated_lufs(_sine(440, 2.0) * 0.5, SR)
+        assert quiet is not None and loud is not None
+        assert loud > quiet
+
+    def test_pyloudnorm_missing_returns_none_no_raise(self, monkeypatch):
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "pyloudnorm":
+                raise ImportError("simulated")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        assert measure_integrated_lufs(_sine(440, 2.0), SR) is None
+
+
+class TestNormalizeLoudnessCall:
+    def test_byte_identical_when_unmeasurable(self):
+        # 무음 → 측정 불가 → 입력 그대로
+        sil = _silence(2.0)
+        out = normalize_loudness_call(sil, SR, target_lufs=-16.0, peak_ceiling_dbfs=-1.0)
+        assert np.array_equal(out, sil)
+
+    def test_uniform_gain_preserves_crest_factor(self):
+        # 균일 gain → peak/rms 비(=snr_db) 보존 → quality_grade 중립 (회귀잠금)
+        audio = _sine(440, 2.0) * 0.05
+        crest_in = float(np.max(np.abs(audio))) / float(np.sqrt(np.mean(audio ** 2)))
+        out = normalize_loudness_call(audio, SR, target_lufs=-16.0, peak_ceiling_dbfs=-1.0)
+        crest_out = float(np.max(np.abs(out))) / float(np.sqrt(np.mean(out ** 2)))
+        assert abs(crest_in - crest_out) < 0.05   # crest factor 보존
+
+    def test_respects_peak_ceiling(self):
+        # 큰 신호를 target 으로 올려도 peak ceiling 초과 금지
+        audio = _sine(440, 2.0) * 0.3
+        out = normalize_loudness_call(audio, SR, target_lufs=0.0, peak_ceiling_dbfs=-1.0)
+        ceiling = 10.0 ** (-1.0 / 20.0)
+        assert float(np.max(np.abs(out))) <= ceiling + 1e-3
+
+    def test_quiet_call_boosted_toward_target(self):
+        audio = _sine(440, 3.0) * 0.02
+        out = normalize_loudness_call(audio, SR, target_lufs=-16.0, peak_ceiling_dbfs=-1.0)
+        after = measure_integrated_lufs(out, SR)
+        # ceiling 에 안 걸리는 한 target 근처(±2 LU). 작은 sine 은 crest 낮아 여유.
+        assert after is not None and after > measure_integrated_lufs(audio, SR)
+
+    def test_does_not_mutate_input(self):
+        audio = _sine(440, 2.0) * 0.05
+        copy = audio.copy()
+        normalize_loudness_call(audio, SR, target_lufs=-16.0, peak_ceiling_dbfs=-1.0)
+        assert np.array_equal(audio, copy)
+
+
+class TestLoudnessGatedLocalGain:
+    def test_noise_floor_window_not_boosted(self, monkeypatch):
+        # 무음 + 미세 white noise → noise floor 근처 → 미부스트(noise breathing 차단, 회귀잠금)
+        monkeypatch.setattr(_cfg, "LOCAL_MAX_GAIN_X", 10.0)
+        rng = np.random.default_rng(0)
+        noise = (rng.standard_normal(SR * 2) * 1e-4).astype(np.float32)
+        out = loudness_gated_local_gain(noise, SR)
+        # 게이팅으로 RMS 가 크게 증폭되지 않아야(현행 local 은 10x 부스트)
+        rms_in = float(np.sqrt(np.mean(noise ** 2)))
+        rms_out = float(np.sqrt(np.mean(out ** 2)))
+        assert rms_out < rms_in * 2.0   # 거의 미부스트
+
+    def test_real_speech_window_boosted(self, monkeypatch):
+        monkeypatch.setattr(_cfg, "LOCAL_MAX_GAIN_X", 10.0)
+        # 현실적 신호: 미세노이즈 floor + 조용한 음성 구간(noise floor 대비 충분히 큼).
+        # 균일 진폭이면 noise floor==신호라 전부 게이팅되므로(설계대로), 변동을 준다.
+        rng = np.random.default_rng(1)
+        noise = (rng.standard_normal(SR * 4) * 1e-4).astype(np.float32)
+        speech_seg = (_sine(300, 1.5) * 0.03).astype(np.float32)
+        signal = noise.copy()
+        signal[SR:SR + len(speech_seg)] += speech_seg   # 1~2.5s 구간에 음성
+        out = loudness_gated_local_gain(signal, SR)
+        # 음성 구간만 부스트되어야 함
+        sp_in = float(np.sqrt(np.mean(signal[SR:SR + len(speech_seg)] ** 2)))
+        sp_out = float(np.sqrt(np.mean(out[SR:SR + len(speech_seg)] ** 2)))
+        assert sp_out > sp_in   # 음성 구간 부스트
+
+    def test_output_within_bounds(self, monkeypatch):
+        monkeypatch.setattr(_cfg, "LOCAL_MAX_GAIN_X", 10.0)
+        out = loudness_gated_local_gain(_sine(440, 2.0) * 0.1, SR)
+        assert float(np.max(np.abs(out))) <= 1.0
+
+
+class TestPreprocessLoudnessGates:
+    def test_loudness_gates_off_no_loudness_step(self, monkeypatch):
+        # 게이트 전부 OFF → loudness/local_gain_gated 단계 미적용
+        monkeypatch.setattr(_cfg, "CALL_LOUDNESS_NORM_ENABLED", False)
+        monkeypatch.setattr(_cfg, "LOUDNESS_LOCAL_GATE_ENABLED", False)
+        monkeypatch.setattr(_cfg, "PREPROCESS_GAIN_ENABLED", True)
+        monkeypatch.setattr(_cfg, "PREPROCESS_DENOISE_ENABLED", False)
+        monkeypatch.setattr(_cfg, "PREPROCESS_DEDUP_ENABLED", False)
+        monkeypatch.setattr(_cfg, "PREPROCESS_SILENCE_ENABLED", False)
+        audio = _sine(440, 2.0) * 0.05
+        # 예외 없이 통과(기존 gain 경로). loudness 미적용이라 출력은 local_normalize_gain 결과.
+        out = preprocess(audio.copy(), SR)
+        assert out is not None and len(out) == len(audio)
+
+    def test_call_loudness_on_applies_uniform_gain(self, monkeypatch):
+        monkeypatch.setattr(_cfg, "CALL_LOUDNESS_NORM_ENABLED", True)
+        monkeypatch.setattr(_cfg, "CALL_LOUDNESS_TARGET_LUFS", -16.0)
+        monkeypatch.setattr(_cfg, "CALL_LOUDNESS_PEAK_DBFS", -1.0)
+        monkeypatch.setattr(_cfg, "LOUDNESS_LOCAL_GATE_ENABLED", False)
+        monkeypatch.setattr(_cfg, "PREPROCESS_GAIN_ENABLED", False)  # gain 단계 끄고 loudness만
+        monkeypatch.setattr(_cfg, "PREPROCESS_DENOISE_ENABLED", False)
+        monkeypatch.setattr(_cfg, "PREPROCESS_DEDUP_ENABLED", False)
+        monkeypatch.setattr(_cfg, "PREPROCESS_SILENCE_ENABLED", False)
+        audio = (_sine(440, 3.0) * 0.02).astype(np.float32)
+        out = preprocess(audio.copy(), SR)
+        # loudness 정규화로 음량 상승
+        assert float(np.sqrt(np.mean(out ** 2))) > float(np.sqrt(np.mean(audio ** 2)))

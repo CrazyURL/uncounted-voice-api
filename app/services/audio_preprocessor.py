@@ -448,6 +448,135 @@ def local_normalize_gain(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# ⑤ Loudness Normalization (EBU R128 / LUFS — 통화단위, 2026-06-02)
+# ---------------------------------------------------------------------------
+
+# pyloudnorm 최소 블록(400ms). 이보다 짧으면 integrated loudness 측정 불가.
+_LUFS_MIN_SEC = 0.4
+
+_pyln_warned = False
+
+
+def measure_integrated_lufs(audio: np.ndarray, sr: int) -> float | None:
+    """ITU-R BS.1770-4(K-weighting + 게이팅) integrated loudness(LUFS) 측정.
+
+    측정 불가 시 None: 길이 <0.4s / 무음 / -inf / config.LUFS_SILENCE_FLOOR 미만 /
+    pyloudnorm 미설치·오류. None 이면 호출자가 정규화를 건너뛴다(안전).
+    """
+    global _pyln_warned
+    if audio is None or len(audio) < int(_LUFS_MIN_SEC * sr):
+        return None
+    try:
+        import pyloudnorm as pyln
+    except ImportError:
+        if not _pyln_warned:
+            logger.warning("pyloudnorm 미설치 — LUFS 정규화 건너뜀")
+            _pyln_warned = True
+        return None
+    try:
+        meter = pyln.Meter(sr)
+        lufs = float(meter.integrated_loudness(np.asarray(audio, dtype=np.float64)))
+    except Exception as exc:  # noqa: BLE001 — 측정 실패는 무중단 skip
+        logger.warning("LUFS 측정 실패 — 건너뜀: %s", exc)
+        return None
+    if not np.isfinite(lufs) or lufs < config.LUFS_SILENCE_FLOOR:
+        return None
+    return lufs
+
+
+def normalize_loudness_call(
+    audio: np.ndarray,
+    sr: int,
+    target_lufs: float,
+    peak_ceiling_dbfs: float,
+) -> np.ndarray:
+    """통화단위 균일 LUFS 정규화. 전체에 단일 gain 적용(발화간 상대음량 보존).
+
+    측정 불가(measure_integrated_lufs=None) 시 입력을 그대로 반환(byte-identical).
+    true-peak ceiling 으로 gain 상한을 걸어 클리핑/품질등급 왜곡을 방지한다.
+    균일 gain 은 peak_db·rms_db 를 동일 dB 이동시켜 snr_db(=|peak-rms|) 불변 →
+    quality_grade 중립(설계 근거).
+    """
+    if len(audio) == 0:
+        return audio
+    lufs = measure_integrated_lufs(audio, sr)
+    if lufs is None:
+        return audio
+
+    gain = 10.0 ** ((target_lufs - lufs) / 20.0)
+
+    # true-peak ceiling: gain 적용 후 최대 진폭이 ceiling 을 넘지 않도록 상한.
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1e-9:
+        ceiling_amp = 10.0 ** (peak_ceiling_dbfs / 20.0)
+        gain = min(gain, ceiling_amp / peak)
+
+    # 선택적 증폭 상한(노이즈 폭주 방어). 0 이면 무제한(ceiling 만).
+    if config.LOUDNESS_GAIN_MAX_X > 0:
+        gain = min(gain, config.LOUDNESS_GAIN_MAX_X)
+
+    # 감쇠 허용 여부(EBU 정석은 양방향). false 면 부스트 전용.
+    if not config.LOUDNESS_ALLOW_ATTENUATE and gain < 1.0:
+        gain = 1.0
+
+    if abs(gain - 1.0) < 1e-4:
+        return audio
+
+    logger.info("통화단위 LUFS 정규화: %.1f → %.1f LUFS (gain=%.2fx, ceiling=%.1fdBFS)",
+                lufs, target_lufs, gain, peak_ceiling_dbfs)
+    return np.clip(audio * gain, -1.0, 1.0).astype(audio.dtype)
+
+
+def loudness_gated_local_gain(audio: np.ndarray, sr: int) -> np.ndarray:
+    """noise-floor 게이팅 로컬 게인 — local_normalize_gain 의 noise breathing 대체.
+
+    윈도우(500ms/100ms hop) RMS 가 noise floor*margin 미만이면 gain=1.0(미부스트)
+    하여 잡음·숨소리 구간의 과증폭을 차단한다. 진짜 음성 윈도우만 부스트.
+    noise floor = max(하위 NOISE_FLOOR_PERCENTILE%ile RMS, 절대 LOUDNESS_GATE_DBFS).
+    """
+    if len(audio) == 0:
+        return audio
+    window_samples = int(0.5 * sr)
+    hop_samples = int(0.1 * sr)
+    if len(audio) < window_samples:
+        return audio
+
+    # 윈도우 RMS 수집
+    centers: list[int] = []
+    rms_list: list[float] = []
+    for start in range(0, len(audio) - window_samples + 1, hop_samples):
+        seg = audio[start:start + window_samples]
+        rms_list.append(float(np.sqrt(np.mean(seg ** 2))))
+        centers.append(start + window_samples // 2)
+    if not rms_list:
+        return audio
+
+    rms_arr = np.asarray(rms_list)
+    nonzero = rms_arr[rms_arr > 1e-9]
+    floor_pct = float(np.percentile(nonzero, config.NOISE_FLOOR_PERCENTILE)) if len(nonzero) else 0.0
+    floor_abs = 10.0 ** (config.LOUDNESS_GATE_DBFS / 20.0)
+    noise_floor = max(floor_pct, floor_abs)
+    gate = noise_floor * config.LOUDNESS_GATE_MARGIN
+
+    gains: list[float] = []
+    gated = 0
+    for r in rms_arr:
+        if r < gate or r <= 1e-7:
+            gains.append(1.0)   # noise floor 근처 → 미부스트(noise breathing 차단)
+            if r > 1e-7:
+                gated += 1
+        else:
+            g = min(TARGET_GAIN_RMS / r, config.LOCAL_MAX_GAIN_X)
+            gains.append(max(g, 1.0))
+
+    gain_curve = np.interp(np.arange(len(audio)), centers, gains).astype(np.float32)
+    boosted = int(np.sum(gain_curve > 1.01))
+    logger.info("loudness 게이팅 로컬 게인: 부스트 %d샘플 / 게이팅 %d윈도우 (floor=%.5f)",
+                boosted, gated, noise_floor)
+    return np.clip(audio * gain_curve, -1.0, 1.0).astype(audio.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -475,9 +604,15 @@ def preprocess(
         applied.append("gain")
 
         t = time.time()
-        result = local_normalize_gain(result, sr)
-        timings["local_gain"] = time.time() - t
-        applied.append("local_gain")
+        if config.LOUDNESS_LOCAL_GATE_ENABLED:
+            # noise-floor 게이팅 로컬 게인 (noise breathing 차단). env-gate 기본 OFF.
+            result = loudness_gated_local_gain(result, sr)
+            timings["local_gain_gated"] = time.time() - t
+            applied.append("local_gain_gated")
+        else:
+            result = local_normalize_gain(result, sr)
+            timings["local_gain"] = time.time() - t
+            applied.append("local_gain")
 
     # 인자 denoise_enabled가 명시되면 우선, 없으면 config 사용
     denoise_on = denoise_enabled if denoise_enabled is not None else config.PREPROCESS_DENOISE_ENABLED
@@ -511,6 +646,19 @@ def preprocess(
         result = compress_silence(result, sr, rms_threshold=silence_threshold)
         timings["silence"] = time.time() - t
         applied.append("silence")
+
+    # ⑤ 통화단위 LUFS 정규화 — 모든 단계 끝난 뒤 1회(발화 슬라이스 직전 상태).
+    # 균일 gain 이라 모든 발화에 동일 적용 → 발화간 상대음량·다이내믹레인지 보존.
+    # env-gate 기본 OFF. denoise+regain 뒤에 위치해 cascade 감쇠도 LUFS 로 정량 복원.
+    if config.CALL_LOUDNESS_NORM_ENABLED:
+        t = time.time()
+        result = normalize_loudness_call(
+            result, sr,
+            target_lufs=config.CALL_LOUDNESS_TARGET_LUFS,
+            peak_ceiling_dbfs=config.CALL_LOUDNESS_PEAK_DBFS,
+        )
+        timings["loudness"] = time.time() - t
+        applied.append("loudness")
 
     new_duration = len(result) / sr
     reduction = (1 - new_duration / original_duration) * 100 if original_duration > 0 else 0
