@@ -2,6 +2,10 @@
 
 WhisperX 기반 음성 처리 API. STT + 화자분리 + 발화분리 + 텍스트/음성 PII 마스킹.
 
+> **📌 진행 맥락(PC 간 공유)**: 이 레포의 결정사항·진행 상태·미완결 트랙·함정은
+> [`docs/CONTEXT_voice-api.md`](docs/CONTEXT_voice-api.md) 참조. 작업 착수 전 반드시 읽을 것.
+> 크로스레포(배포/admin/api) 맥락은 `Uncounted-root/docs/CONTEXT_uncounted_ecosystem.md`.
+
 ## 기술 스택
 
 - Python 3.12 / FastAPI / Uvicorn
