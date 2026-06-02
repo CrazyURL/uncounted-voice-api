@@ -22,6 +22,7 @@ from app.services.speaker_recluster import (
     maybe_recluster_speakers,
     renumber_speakers_in_place,
 )
+from app.services import gpu_process_lock as _gpu_process_lock
 from app.services.utterance_segmenter import segment as segment_utterances
 from app.services.audio_pii_masker import find_pii_word_ranges, mask_audio_ranges
 from app.services.audio_splitter import (
@@ -524,6 +525,9 @@ def _transcribe_chunk(
     # GPU 추론 (전처리는 호출자가 이미 적용)
     lock_wait_start = time.time()
     _gpu_lock.acquire()
+    # 프로세스 간 GPU 락(env-gated). NeMo 서비스(별도 프로세스)와 동시 추론 방지.
+    _proc_lock = _gpu_process_lock.gpu_process_lock(f"stt-chunk-{task_id}")
+    _proc_lock.__enter__()
     lock_wait_ms = int((time.time() - lock_wait_start) * 1000)
     inference_start = time.time()
     job_store.update_gpu_acquired(task_id)
@@ -554,6 +558,7 @@ def _transcribe_chunk(
     finally:
         inference_ms = int((time.time() - inference_start) * 1000)
         torch.cuda.empty_cache()
+        _proc_lock.__exit__(None, None, None)
         _gpu_lock.release()
         job_store.update_gpu_released(task_id)
         logger.info(
@@ -773,6 +778,9 @@ def transcribe(
 
             lock_wait_start = time.time()
             _gpu_lock.acquire()
+            # 프로세스 간 GPU 락(env-gated). NeMo 서비스와 동시 추론 방지.
+            _proc_lock = _gpu_process_lock.gpu_process_lock(f"stt-{task_id}")
+            _proc_lock.__enter__()
             lock_wait_ms = int((time.time() - lock_wait_start) * 1000)
             inference_start = time.time()
             job_store.update_gpu_acquired(task_id)
@@ -798,11 +806,6 @@ def transcribe(
 
                         # Phase 7: WeSpeaker reclustering (non-chunked path)
                         result = _apply_reclustering(audio, config.SAMPLE_RATE, result, task_id)
-
-                        # 하이브리드 도입부 재분리(env-gated, non-chunked). pyannote 가
-                        # 통화 도입부 짧은 turn 을 단일화자로 뭉치는 문제를 NeMo MSDD 로
-                        # 보정. 게이트 OFF/서비스 미응답 시 result 무변경(무중단).
-                        result = _maybe_apply_hybrid_intro(audio, config.SAMPLE_RATE, result, file_path, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
@@ -810,12 +813,19 @@ def transcribe(
             finally:
                 inference_ms = int((time.time() - inference_start) * 1000)
                 torch.cuda.empty_cache()
+                _proc_lock.__exit__(None, None, None)
                 _gpu_lock.release()
                 job_store.update_gpu_released(task_id)
                 logger.info(
                     "[%s] GPU lock 해제 | inference_ms=%d lock_wait_ms=%d (VRAM 정리 완료)",
                     task_id, inference_ms, lock_wait_ms,
                 )
+
+            # 하이브리드 도입부 재분리(env-gated, non-chunked). GPU 프로세스 락 밖에서
+            # 호출해야 NeMo 서비스(같은 프로세스 락 사용)와 데드락이 나지 않는다.
+            # 게이트 OFF/서비스 미응답 시 result 무변경(무중단).
+            if enable_diarize and _diarize_model is not None:
+                result = _maybe_apply_hybrid_intro(audio, config.SAMPLE_RATE, result, file_path, task_id)
 
             segments = _clean_segments(result["segments"])
             diarize_active = enable_diarize and _diarize_model is not None
