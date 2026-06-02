@@ -28,11 +28,12 @@
   (`SILENCE_RMS_THRESHOLD_DENOISE=0.0005`)으로 보완.
 - DeepFilterNet은 **이미 구현돼 있음**(별도 subprocess, 파일기반 통신, CPU 격리)이나 기본 OFF.
 
-**🟡 PR #29 DRAFT — LUFS 정규화 + noise breathing 게이트** (2026-06-02):
+**🟡 PR #29 (OPEN·미머지) — LUFS 정규화 + noise breathing 게이트** (2026-06-02, GitHub API 실측확인 `state=open`):
 - 문제: denoise OFF인데 `local 30x` 부스트 → 조용한 윈도우의 미세 소음 증폭(noise breathing) 시한폭탄.
 - 변경: `LOCAL_MAX_GAIN_X 30→10` + **통화 단위 균일 LUFS**(클립별 적분 LUFS의 짧은-클립 불안정 회피) +
   noise floor 게이트. 통화 단위 정규화는 `snr_db` 불변 → **품질 등급 중립**(실측 확인).
-- 전부 **env-gate OFF**, canary 후 활성. **테스트 590 passed**.
+- `pyloudnorm==0.1.1` 추가, 통화 target `-16 LUFS` / peak `-1 dBFS`. 전부 **env-gate OFF**, canary 후 활성. **테스트 590 passed**.
+- ⚠️ **머지 위생**: PR 브랜치(`c3332b1`)가 이 문서 커밋(`3e26fd4`)보다 과거라, `git diff main..pr29`(two-dot)에 이 CONTEXT/분석 docs가 **삭제로 착시** 표시됨. 정상 3-way 머지는 문서를 **삭제하지 않음**. 머지 전 최신 main 위로 rebase 권장.
 
 **발화 클립 추출 지점** (대안2 LUFS 삽입점): `app/services/audio_splitter.py`의
 `extract_utterance_audio()`는 순수 슬라이스(정규화 없음) → `stt_processor.py`에서 `utterance_NNN.wav`로 저장.
@@ -42,7 +43,7 @@
 ## 2. 화자분리 / 발화분리
 
 **✅ 하이브리드 발화분리 PR #27** (머지·가동·e2e 검증완료, 2026-06-02, `e5dabc1`):
-- 도입부 30초를 **NeMo MSDD로 재분리** + 코사인 ID 매핑 + 하드 오버라이트.
+- 도입부 30초를 **NeMo MSDD로 재분리** + ID 매핑(**F0/성별 앵커 1차, cosine 2차** — cross-model cosine이 약해 서브로 강등) + 하드 오버라이트.
 - ★ 세션 `93c28f57` 재처리에서 GT1 **ABAB**(본인-상대-본인-상대) 복원 성공.
 - 결합 VRAM 3987MiB 안전. **NeMo 서비스 :8009** (background, **systemd 아님 → 재부팅 시 수동 기동**).
 - env gate ON(`.env.dev`). 후속: systemd 유닛화 / chunked / 일반화.
