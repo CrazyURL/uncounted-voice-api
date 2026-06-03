@@ -767,9 +767,16 @@ def transcribe(
             diarize_active = enable_diarize and _diarize_model is not None
         else:
             # ── 일반 모드: 전체 로딩 + 전처리 ──
-            audio = whisperx.load_audio(str(file_path))
-            logger.info("[%s] 오디오 로드 완료 (%.1fs)", task_id, len(audio) / config.SAMPLE_RATE)
-            audio = preprocess(audio, config.SAMPLE_RATE)
+            raw_audio = whisperx.load_audio(str(file_path))
+            logger.info("[%s] 오디오 로드 완료 (%.1fs)", task_id, len(raw_audio) / config.SAMPLE_RATE)
+            audio = preprocess(raw_audio, config.SAMPLE_RATE)
+            # STT(전사+정렬)는 게인 미적용 raw 오디오로 수행한다. preprocess 의 gain 이 통화
+            # 끝부분 음성을 미세 왜곡하면 whisper 가 그 구간을 정렬 불가능한 텍스트로 전사하고,
+            # forced alignment(wav2vec2)가 그 세그먼트를 통째로 드롭 → 통화 끝부분이 잘리는
+            # 버그(끝 24초 누락 실측). 게인은 STT 품질을 개선하지도 않음(실측 동등). 타이밍이
+            # 보존된 경우(gain 만·길이 불변)에만 raw 사용, 무음압축 등으로 길이가 변하면
+            # 타임라인 정합 위해 preprocess 오디오로 폴백. diarization 등 후속은 audio 사용.
+            stt_audio = raw_audio if len(raw_audio) == len(audio) else audio
 
             lock_wait_start = time.time()
             _gpu_lock.acquire()
@@ -778,13 +785,13 @@ def transcribe(
             job_store.update_gpu_acquired(task_id)
             logger.info("[%s] GPU lock 획득 | lock_wait_ms=%d", task_id, lock_wait_ms)
             try:
-                result = _transcribe_with_oom_guard(audio, task_id)
+                result = _transcribe_with_oom_guard(stt_audio, task_id)
                 logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
 
                 try:
                     result = whisperx.align(
                         result["segments"], _align_model, _align_metadata,
-                        audio, config.DEVICE, return_char_alignments=False,
+                        stt_audio, config.DEVICE, return_char_alignments=False,
                     )
                     logger.info("[%s] Alignment 완료", task_id)
                 except Exception as align_err:
