@@ -346,24 +346,26 @@ def _apply_reclustering(
 def _intro_speaker_embeddings(
     audio: "np.ndarray", sample_rate: int, result: dict, window_sec: float,
 ) -> dict[str, list[float]]:
-    """도입부 윈도우 내 pyannote 화자별 대표 임베딩 (하이브리드 코사인 ID매핑용).
+    """pyannote 화자별 대표 임베딩 (하이브리드 코사인 ID매핑용).
 
-    각 화자의 도입부(0~window_sec) 최장 segment 로 WeSpeaker 임베딩 추출.
+    **전체 통화**의 각 화자 최장 segment 로 WeSpeaker 임베딩 추출(도입부 한정 X).
+    이유: pyannote 가 도입부를 단일화자로 뭉치면 도입부 임베딩이 1개뿐이라 NeMo 2명과
+    1:1 매핑이 깨져 GT1 이 불안정해진다(2026-06-02 진단). 전체 통화에서는 두 화자 모두
+    충분한 발화가 있어 임베딩 2개가 안정적으로 나오고, 코사인 매핑이 결정적이 된다.
     실패/짧음은 건너뛴다(빈 dict 면 hybrid 가 overlap 백업으로 위임).
     """
     global _speaker_embedding_model
     if _speaker_embedding_model is None:
         _speaker_embedding_model = SpeakerEmbeddingModel()
-    # 화자별 도입부 최장 구간
+    # 화자별 전체 통화 최장 구간 (window_sec 제한 제거 → 안정적 화자 지문)
     longest: dict[str, tuple[float, float]] = {}
     for seg in result.get("segments", []):
         spk = seg.get("speaker")
         s, e = seg.get("start"), seg.get("end")
-        if not spk or s is None or e is None or float(s) >= window_sec:
+        if not spk or s is None or e is None:
             continue
-        e = min(float(e), window_sec)
-        if spk not in longest or (e - float(s)) > (longest[spk][1] - longest[spk][0]):
-            longest[spk] = (float(s), e)
+        if spk not in longest or (float(e) - float(s)) > (longest[spk][1] - longest[spk][0]):
+            longest[spk] = (float(s), float(e))
     from app.services.speaker_embedding import EmbeddingUnavailable
     embs: dict[str, list[float]] = {}
     for spk, (s, e) in longest.items():
@@ -375,6 +377,88 @@ def _intro_speaker_embeddings(
         if not isinstance(emb, EmbeddingUnavailable):
             embs[spk] = emb.tolist()
     return embs
+
+
+def _speaker_f0_medians(
+    audio: "np.ndarray", sample_rate: int, result: dict,
+) -> dict[str, float]:
+    """pyannote 화자별 F0(피치) median — 하이브리드 어쿠스틱 앵커용.
+
+    각 화자 전체통화 발화 구간(최대 누적 20s)에서 librosa.pyin F0 median.
+    두 male 화자처럼 임베딩 코사인이 약할 때 F0 차이로 ID 매핑 방향을 확정한다.
+    librosa 미가용/F0 부족이면 해당 화자 생략(빈 dict 면 앵커 미사용).
+    """
+    try:
+        import librosa  # type: ignore
+    except ImportError:
+        return {}
+    # 화자별 구간 수집 (최장순, 누적 ~20s)
+    by_spk: dict[str, list[tuple[float, float]]] = {}
+    for seg in result.get("segments", []):
+        spk = seg.get("speaker")
+        s, e = seg.get("start"), seg.get("end")
+        if spk and s is not None and e is not None:
+            by_spk.setdefault(spk, []).append((float(s), float(e)))
+    f0s: dict[str, float] = {}
+    for spk, segs in by_spk.items():
+        segs.sort(key=lambda x: x[1] - x[0], reverse=True)
+        parts, total = [], 0.0
+        for s, e in segs:
+            parts.append(audio[int(s * sample_rate):int(e * sample_rate)])
+            total += e - s
+            if total >= 20.0:
+                break
+        if not parts:
+            continue
+        chunk = np.concatenate(parts)
+        if len(chunk) < sample_rate * 0.3:
+            continue
+        try:
+            f0, _, _ = librosa.pyin(
+                chunk.astype(np.float32),
+                fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"),
+                sr=sample_rate,
+            )
+            valid = f0[~np.isnan(f0)]
+            if len(valid) >= 10:
+                f0s[spk] = float(np.median(valid))
+        except Exception:  # noqa: BLE001
+            continue
+    return f0s
+
+
+def _maybe_apply_anchor_diar(
+    audio: "np.ndarray", sample_rate: int, result: dict, file_path, task_id: str,
+) -> dict:
+    """전체 통화 앵커 화자분리 보정 hook (env-gated, non-chunked).
+
+    비슷한 두 화자(클러스터링 붕괴)를 도입부 앵커 1:2 분류로 보정. 게이트 OFF/
+    NeMo 미응답/앵커 실패 시 result 무변경(무중단 fallback). 도입부 한정 hybrid 와 달리
+    전체 통화 word.speaker 를 보정한다.
+    """
+    try:
+        from app.services import anchor_diarization
+        if not anchor_diarization.is_enabled():
+            return result
+        global _speaker_embedding_model
+        if _speaker_embedding_model is None:
+            _speaker_embedding_model = SpeakerEmbeddingModel()
+        from app.services.speaker_embedding import EmbeddingUnavailable
+
+        def _embed(seg, sr: int):
+            r = _speaker_embedding_model.extract_embedding(seg, sr)
+            if isinstance(r, EmbeddingUnavailable):
+                return None
+            v = np.asarray(r, dtype="float32")
+            nrm = float(np.linalg.norm(v))
+            return (v / nrm) if nrm > 1e-9 else None
+
+        return anchor_diarization.apply_anchor_diarization(
+            result, str(file_path), audio, sample_rate, embed_fn=_embed,
+        )
+    except Exception as exc:  # noqa: BLE001 — 앵커 실패가 STT 전체를 막지 않도록
+        logger.warning("[%s] 앵커 화자분리 실패 — 원본 유지: %s", task_id, exc)
+        return result
 
 
 def _maybe_apply_hybrid_intro(
@@ -390,8 +474,12 @@ def _maybe_apply_hybrid_intro(
             return result
         win = hybrid_diarization._window_sec()
         intro_embs = _intro_speaker_embeddings(audio, sample_rate, result, win)
+        pyannote_f0 = _speaker_f0_medians(audio, sample_rate, result)  # 매핑 메인 앵커
         return hybrid_diarization.apply_hybrid_intro(
-            result, str(file_path), pyannote_embeddings=intro_embs, window_sec=win,
+            result, str(file_path),
+            pyannote_embeddings=intro_embs,
+            pyannote_f0=pyannote_f0,
+            window_sec=win,
         )
     except Exception as exc:  # noqa: BLE001 — 하이브리드 실패가 STT 전체를 막지 않도록
         logger.warning("[%s] 하이브리드 도입부 재분리 실패 — 원본 유지: %s", task_id, exc)
@@ -449,6 +537,43 @@ def _transcribe_with_oom_guard(audio, task_id: str) -> dict:
                 raise
             current = next_bs
             logger.info("[%s] OOM fallback → batch_size=%d", task_id, current)
+
+
+def _maybe_attach_overlap(audio, sample_rate, utterances, task_id):
+    """Task 5 — 화자중첩(overlap) 탐지 hook (env-gated, 무중단 fallback).
+
+    OVERLAP_DETECTION_ENABLED=true 일 때만 동작. pyannote overlap-aware annotation
+    (get_overlap)으로 동시발화 구간을 구해 utterance 별 메타를 부착한다.
+    실패/미가용/청크모드(audio None) 시 utterances 무변경(파이프라인 무중단).
+    v1: _diarize_model 내부 pyannote pipeline 을 재사용(모델 추가로드 없음)해 별도
+    diarization pass 1회 수행. 추후 메인 pass annotation 캡처로 중복추론 제거 가능.
+    """
+    if not config.OVERLAP_DETECTION_ENABLED or not utterances or audio is None:
+        return
+    try:
+        from app.services.overlap_detection import (
+            extract_overlap_regions,
+            utterance_overlap_features,
+        )
+
+        pmodel = getattr(_diarize_model, "model", None)
+        if pmodel is None:
+            logger.warning("[%s] overlap: pyannote pipeline 미접근 — skip", task_id)
+            return
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        diar = pmodel({"waveform": wav, "sample_rate": sample_rate})
+        regions = extract_overlap_regions(diar, cutoff_sec=config.OVERLAP_CUTOFF_SEC)
+        for utt in utterances:
+            utt.update(utterance_overlap_features(
+                utt.get("start_sec"), utt.get("end_sec"), regions,
+            ))
+        flagged = sum(1 for u in utterances if u.get("is_overlapping"))
+        logger.info(
+            "[%s] overlap 탐지 완료: regions=%d flagged=%d/%d (cutoff=%.2fs)",
+            task_id, len(regions), flagged, len(utterances), config.OVERLAP_CUTOFF_SEC,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[%s] overlap 탐지 실패(무시): %s", task_id, e)
 
 
 def load_models():
@@ -827,6 +952,11 @@ def transcribe(
                         # 통화 도입부 짧은 turn 을 단일화자로 뭉치는 문제를 NeMo MSDD 로
                         # 보정. 게이트 OFF/서비스 미응답 시 result 무변경(무중단).
                         result = _maybe_apply_hybrid_intro(audio, config.SAMPLE_RATE, result, file_path, task_id)
+
+                        # 앵커 화자분리 보정(env-gated, 전체 통화). 비슷한 두 화자에서
+                        # 클러스터링이 붕괴해 발화에 여러 화자가 뭉치는 문제를 도입부 앵커
+                        # 1:2 분류로 보정. OFF/실패 시 무변경(무중단).
+                        result = _maybe_apply_anchor_diar(audio, config.SAMPLE_RATE, result, file_path, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
@@ -1050,6 +1180,9 @@ def transcribe(
                 u["dialog_act"] = lbl.dialog_act
                 u["dialog_act_confidence"] = lbl.dialog_act_confidence
                 u["auto_label_model_version"] = lbl.model_version
+
+        # Task 5: 화자중첩(overlap) 메타 부착 (env-gated, 무중단 fallback)
+        _maybe_attach_overlap(audio, config.SAMPLE_RATE, utterances_result, task_id)
 
         # STAGE 16: 주제 세그먼트 탐지 (발화가 3개 이상일 때만 의미 있음)
         topic_segments_result: list[dict] | None = None

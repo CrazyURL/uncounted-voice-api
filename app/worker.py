@@ -686,6 +686,15 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "language_mix_flag": utt.get("language_mix_flag"),
             "updated_at": _now_iso(),
         }
+        # Task 5: 화자중첩(overlap) 메타 — utt 에 키가 있을 때만 포함.
+        # (게이트 OFF 기본값이면 stt_processor 가 키를 안 만들므로 미포함 → 컬럼
+        #  미적용 DB 에서도 upsert 안전. 게이트 ON 전에 migration 20260602 선적용 필수.)
+        if "is_overlapping" in utt:
+            row["is_overlapping"] = utt.get("is_overlapping")
+            row["overlap_count"] = utt.get("overlap_count")
+            row["overlap_total_sec"] = utt.get("overlap_total_sec")
+            row["overlap_ratio"] = utt.get("overlap_ratio")
+            row["overlap_intervals"] = utt.get("overlap_intervals")
         # 정책 P: 수동 검수/마스킹된 행(또는 precheck 실패)이면 pii_intervals 를 payload 에서 제거해 보존.
         row = strip_pii_if_curated(row, seq, curated_seqs, precheck_ok)
         # NaN/Inf 가드: snr_db / transcript_words(WhisperX alignment) / *_confidence 등 모델 산출
@@ -771,6 +780,28 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     finally:
         if preproc_tmp and os.path.exists(preproc_tmp):
             os.unlink(preproc_tmp)
+
+    # Task 8: data lineage — 세션 처리 run 1건 기록 + utterances FK 배선.
+    # env-gate 기본 OFF(켜기 전 migration 20260603 선적용 필수) · try/except 무중단.
+    try:
+        from app import config as _cfg
+        if _cfg.LINEAGE_TRACKING_ENABLED:
+            from app.services.lineage import build_run_record
+            rec = build_run_record(session_id, task_id, job_result)
+            ins = await _run(
+                lambda r=rec: _supabase.table("lineage_runs").insert(r).execute()
+            )
+            run_id = (ins.data or [{}])[0].get("id") if ins and ins.data else None
+            if run_id is not None:
+                await _run(
+                    lambda rid=run_id: _supabase.table("utterances")
+                    .update({"latest_lineage_run_id": rid})
+                    .eq("session_id", session_id)
+                    .execute()
+                )
+            log.info("[%s] lineage run 기록 완료 (run_id=%s)", session_id, run_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[%s] lineage 기록 실패(무시): %s", session_id, e)
 
     return upserted
 
