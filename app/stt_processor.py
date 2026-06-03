@@ -516,10 +516,18 @@ def _transcribe_chunk(
     task_id: str,
     enable_diarize: bool,
     diarization_options: dict | None = None,
+    raw_audio: np.ndarray | None = None,
 ) -> list[dict]:
     """단일 청크를 GPU 추론하고 정리된 세그먼트를 반환한다."""
     if diarization_options is None:
         diarization_options = {}
+
+    # STT(전사+정렬)는 게인 미적용 raw 청크로 수행한다(normal 모드와 동일 — preprocess 의
+    # gain 이 끝부분 음성을 왜곡해 forced alignment 가 그 세그먼트를 드롭하는 truncation 방지).
+    # 무음압축으로 청크 길이가 변하면(len 불일치) 타임라인 정합 위해 audio(전처리본)로 폴백.
+    # ⚠️ 무음압축이 청크 길이를 바꾸는 케이스는 폴백되어 본 가드로는 미해결(완전 수정은
+    # preprocess 의 gain↔silence 분리 리팩터 필요). diarization/recluster 는 audio 사용.
+    stt_audio = raw_audio if (raw_audio is not None and len(raw_audio) == len(audio)) else audio
 
     # GPU 추론 (전처리는 호출자가 이미 적용)
     lock_wait_start = time.time()
@@ -529,13 +537,13 @@ def _transcribe_chunk(
     job_store.update_gpu_acquired(task_id)
     logger.info("[%s] GPU lock 획득 | lock_wait_ms=%d", task_id, lock_wait_ms)
     try:
-        result = _transcribe_with_oom_guard(audio, task_id)
+        result = _transcribe_with_oom_guard(stt_audio, task_id)
         logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
 
         try:
             result = whisperx.align(
                 result["segments"], _align_model, _align_metadata,
-                audio, config.DEVICE, return_char_alignments=False,
+                stt_audio, config.DEVICE, return_char_alignments=False,
             )
             logger.info("[%s] Alignment 완료", task_id)
         except Exception as align_err:
@@ -614,6 +622,9 @@ def _transcribe_chunked(
     # 청크 경계에서 silence compression 등으로 삭제된 구간이 타임스탬프 gap으로
     # 나타나지 않도록 보정한다.
     cumulative_preprocessed_offset = 0.0
+    # 계측: raw≠전처리본(무음압축 길이변동)으로 STT gain-guard 가 폴백(=truncation 위험 잔존)한
+    # 청크 수. 실제 >1시간 통화의 폴백률을 데이터로 측정해 완전 리팩터(gain/silence 분리) 발동 판단.
+    gain_fallback_chunks = 0
     diarize_active = enable_diarize and _diarize_model is not None
     emit_utterances = split_by_utterance and diarize_active
 
@@ -632,10 +643,12 @@ def _transcribe_chunked(
 
         try:
             # 청크 로딩 + 전처리 + 처리
-            chunk_audio = whisperx.load_audio(str(chunk_path))
-            original_chunk_duration = len(chunk_audio) / config.SAMPLE_RATE
-            chunk_audio = preprocess(chunk_audio, config.SAMPLE_RATE)
+            raw_chunk = whisperx.load_audio(str(chunk_path))
+            original_chunk_duration = len(raw_chunk) / config.SAMPLE_RATE
+            chunk_audio = preprocess(raw_chunk, config.SAMPLE_RATE)
             preprocessed_chunk_duration = len(chunk_audio) / config.SAMPLE_RATE
+            if len(raw_chunk) != len(chunk_audio):
+                gain_fallback_chunks += 1  # 계측: STT gain-guard 폴백(raw≠전처리본=길이변동)
 
             if preprocessed_chunk_duration < original_chunk_duration - 0.1:
                 logger.info(
@@ -645,7 +658,7 @@ def _transcribe_chunked(
                     original_chunk_duration - preprocessed_chunk_duration,
                 )
 
-            chunk_segments = _transcribe_chunk(chunk_audio, task_id, enable_diarize, diarization_options)
+            chunk_segments = _transcribe_chunk(chunk_audio, task_id, enable_diarize, diarization_options, raw_audio=raw_chunk)
 
             # 4. 음성 PII 마스킹 (청크 모드)
             # D4b: range 산출 게이트 = (mask_audio_pii OR pii_intervals_only),
@@ -698,10 +711,14 @@ def _transcribe_chunked(
                 pass
             torch.cuda.empty_cache()
 
+    _total_chunks = len(boundaries) - 1
     logger.info(
-        "[%s] 청크 모드 완료 (총 %d 세그먼트, %d 발화, %d개 PII 마스킹, 전처리 후 총 길이 %.1fs / 원본 %.1fs)",
+        "[%s] 청크 모드 완료 (총 %d 세그먼트, %d 발화, %d개 PII 마스킹, 전처리 후 총 길이 %.1fs / 원본 %.1fs"
+        " | STT gain-guard 폴백 청크 %d/%d = %.1f%%)",
         task_id, len(all_segments), len(all_utterances), len(all_pii_audio_ranges),
         cumulative_preprocessed_offset, total_duration,
+        gain_fallback_chunks, _total_chunks,
+        (gain_fallback_chunks / _total_chunks * 100) if _total_chunks else 0.0,
     )
     return all_segments, all_utterances, audio_files, all_pii_audio_ranges
 
