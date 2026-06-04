@@ -695,6 +695,11 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             row["overlap_total_sec"] = utt.get("overlap_total_sec")
             row["overlap_ratio"] = utt.get("overlap_ratio")
             row["overlap_intervals"] = utt.get("overlap_intervals")
+        # T2: 검수 소프트플래그 — utt 에 키가 있을 때만 포함(REVIEW_FLAGS_ENABLED ON +
+        # migration 20260604 선적용 시에만 생성). overlap 과 동일한 안전 게이팅.
+        if "review_flags" in utt:
+            row["review_flags"] = utt.get("review_flags")
+            row["review_priority_score"] = utt.get("review_priority_score")
         # 정책 P: 수동 검수/마스킹된 행(또는 precheck 실패)이면 pii_intervals 를 payload 에서 제거해 보존.
         row = strip_pii_if_curated(row, seq, curated_seqs, precheck_ok)
         # NaN/Inf 가드: snr_db / transcript_words(WhisperX alignment) / *_confidence 등 모델 산출

@@ -16,6 +16,7 @@ from app.core.job_store import job_store
 from app.hotword_engine import build_domain_prompt, correct_confusions, get_profile
 from app.text_quality import collapse_segment_repetitions
 from app.ner_guard import mask_utterance
+from app.review_flags_builder import build_utterance_review_flags
 from app.pii_masker import mask_pii, mask_segments
 from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
@@ -1143,6 +1144,19 @@ def transcribe(
                             ner_masked += n
                     if ner_masked:
                         logger.info("[%s] NER 가드 풀네임 자동마스킹 %d건", task_id, ner_masked)
+
+                # 검수 소프트플래그(호격/Nim-Guard) — post-mask 텍스트 기준, env-gate 기본 OFF.
+                # overlap 패턴: 키는 게이트 ON 일 때만 생성 → 컬럼 미적용 DB upsert 안전.
+                if config.REVIEW_FLAGS_ENABLED:
+                    flagged = 0
+                    for u in utterances_result:
+                        rflags, score = build_utterance_review_flags(u["transcript_text"])
+                        if rflags:
+                            u["review_flags"] = rflags
+                            u["review_priority_score"] = score
+                            flagged += 1
+                    if flagged:
+                        logger.info("[%s] 검수 플래그 %d발화", task_id, flagged)
                 logger.info("[%s] 발화 %d개 분리 완료", task_id, len(utterances_result))
 
             if split_by_speaker:

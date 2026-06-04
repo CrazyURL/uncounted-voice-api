@@ -146,6 +146,10 @@ NER_GUARD_ENABLED = os.environ.get("NER_GUARD_ENABLED", "false").lower() in ("tr
 # 설계: docs/design_review_panel_redesign_20260603.md §7. text+words 동기 축약.
 TEXT_QUALITY_REPETITION_ENABLED = os.environ.get("TEXT_QUALITY_REPETITION_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# 검수 소프트플래그(호격/Nim-Guard 등) → review_flags/review_priority_score 적재 — 기본 OFF.
+# ⚠️ ON 전에 migration 20260604_add_review_flags.sql 선적용 필수(overlap 패턴: 키 있을 때만 upsert).
+REVIEW_FLAGS_ENABLED = os.environ.get("REVIEW_FLAGS_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # ─────────────────────────────────────────────────────────────
 # 전처리 파이프라인 단계별 토글 (품질 보존 점진 활성화)
 # Round 1: gain만 ON → Round 2: + silence → Round 3: + denoise → Round 4: + dedup
