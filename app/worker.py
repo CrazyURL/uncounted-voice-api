@@ -694,6 +694,15 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "language_mix_flag": utt.get("language_mix_flag"),
             "updated_at": _now_iso(),
         }
+        # P3: Tier A/B 통계·언어 라벨(write-orphan 채움) — GPU 불요, quality_grade·prev 가용.
+        # 컬럼은 이미 존재(payload 에 항상 있음)하므로 row.update 안전.
+        from app import config as _cfg
+        if _cfg.STAT_LABELS_ENABLED:
+            from app.utterance_labels import build_utterance_stat_labels
+            prev = utterances[i - 1] if i > 0 else None
+            row.update(build_utterance_stat_labels(
+                {**utt, "quality_grade": quality_grade, "duration_sec": duration_sec}, prev,
+            ))
         # Task 5: 화자중첩(overlap) 메타 — utt 에 키가 있을 때만 포함.
         # (게이트 OFF 기본값이면 stt_processor 가 키를 안 만들므로 미포함 → 컬럼
         #  미적용 DB 에서도 upsert 안전. 게이트 ON 전에 migration 20260602 선적용 필수.)

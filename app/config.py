@@ -167,6 +167,10 @@ NER_GUARD_ENABLED = os.environ.get("NER_GUARD_ENABLED", "false").lower() in ("tr
 # 설계: docs/design_review_panel_redesign_20260603.md §7. text+words 동기 축약.
 TEXT_QUALITY_REPETITION_ENABLED = os.environ.get("TEXT_QUALITY_REPETITION_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# Tier A/B 통계·언어 라벨(speech_rate_wpm/filler/honorific/question/language_mix/
+# audio_quality_class/silence_before) 산출 — write-orphan 채움. 기본 OFF. GPU 불요.
+STAT_LABELS_ENABLED = os.environ.get("STAT_LABELS_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # ★Gate-1: 오디오 PII 비프(1kHz) — 발화 WAV의 PII 음성 마스킹. 기본 OFF.
 # ON 시 worker 가 mask_audio_pii=true 요청 → 저장 WAV 자체가 깨끗(export 경로 무관 fail-safe).
 # 비프 대상은 CORE_PII_LABELS(고정밀)만 — 오디오 변형은 되돌릴 수 없어 보수적.
