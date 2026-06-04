@@ -69,6 +69,18 @@ class TestCorrectConfusions:
         assert "수석님" in out[0]["text"]
         assert "선생님" not in out[0]["text"]
 
+    def test_dplus_it_abbrev_dap_to_dlp(self):
+        # D+ : B 프롬프트 폐기, DLP 약어 오역을 사후 D 교정으로 흡수 (family-safe)
+        segs = self._segs("DAP 통제 브라우저 보안 정책 공동인증서")
+        out, n = correct_confusions(segs, IT)
+        assert n >= 1
+        assert "DLP" in out[0]["text"] and "DAP" not in out[0]["text"]
+
+    def test_dplus_abbrev_not_corrected_non_domain(self):
+        # 비IT(키워드<2)에선 DAP 보존
+        out, n = correct_confusions(self._segs("DAP 노래 잘 들었어"), IT)
+        assert n == 0
+
     def test_family_context_does_not_correct(self):
         # 비도메인: 선생님(학교) 그대로 보존 — family-safe
         segs = self._segs("우리 애 선생님이 오늘 전화 왔어 저녁 뭐먹지")
