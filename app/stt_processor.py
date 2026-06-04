@@ -490,6 +490,31 @@ def _maybe_apply_hybrid_intro(
         return result
 
 
+def _maybe_apply_dynamic_diar(
+    audio: "np.ndarray", sample_rate: int, result: dict, file_path, task_id: str,
+) -> dict:
+    """통화 길이 기반 화자분리 보정 라우터 (non-chunked).
+
+    ≤VOICE_DIAR_THRESHOLD_SEC 이고 NeMo-full 게이트 ON → NeMo 전체재분리(도입부 정확).
+    그 외 → anchor(>임계 OOM 방어, 또는 NeMo-full OFF 시 폴백). 둘 다 OFF/실패 시 무변경.
+    """
+    try:
+        duration = (len(audio) / sample_rate) if sample_rate else 0.0
+        if duration <= config.VOICE_DIAR_THRESHOLD_SEC:
+            from app.services import nemo_full_diarization as nf
+            if nf.is_enabled():
+                logger.info("[%s] 동적 화자분리: %.0fs ≤ %.0fs → NeMo-full",
+                            task_id, duration, config.VOICE_DIAR_THRESHOLD_SEC)
+                return nf.apply_nemo_full_diarization(
+                    result, str(file_path), audio, sample_rate, duration, task_id,
+                )
+        # >임계 또는 NeMo-full OFF → anchor
+        return _maybe_apply_anchor_diar(audio, sample_rate, result, file_path, task_id)
+    except Exception as exc:  # noqa: BLE001 — 라우팅 실패가 STT 전체를 막지 않도록
+        logger.warning("[%s] 동적 화자분리 라우팅 실패 — 원본 유지: %s", task_id, exc)
+        return result
+
+
 def _do_speaker_assign(diarize_segments, result, task_id: str):
     """SPEAKER_MAPPING_MODE 분기 — raw_direct (Phase 3) | whisperx (legacy)."""
     mode = config.SPEAKER_MAPPING_MODE
@@ -964,15 +989,10 @@ def transcribe(
                         # Phase 7: WeSpeaker reclustering (non-chunked path)
                         result = _apply_reclustering(audio, config.SAMPLE_RATE, result, task_id)
 
-                        # 하이브리드 도입부 재분리(env-gated, non-chunked). pyannote 가
-                        # 통화 도입부 짧은 turn 을 단일화자로 뭉치는 문제를 NeMo MSDD 로
-                        # 보정. 게이트 OFF/서비스 미응답 시 result 무변경(무중단).
-                        result = _maybe_apply_hybrid_intro(audio, config.SAMPLE_RATE, result, file_path, task_id)
-
-                        # 앵커 화자분리 보정(env-gated, 전체 통화). 비슷한 두 화자에서
-                        # 클러스터링이 붕괴해 발화에 여러 화자가 뭉치는 문제를 도입부 앵커
-                        # 1:2 분류로 보정. OFF/실패 시 무변경(무중단).
-                        result = _maybe_apply_anchor_diar(audio, config.SAMPLE_RATE, result, file_path, task_id)
+                        # ★동적 스위칭(2026-06-03 확정·06-05 실측): 통화 길이로 화자분리 보정
+                        # 엔진 라우팅. ≤VOICE_DIAR_THRESHOLD_SEC → NeMo 전체재분리(도입부 정확),
+                        # 초과 → anchor(OOM 방어). 게이트 OFF/실패 시 무변경(무중단).
+                        result = _maybe_apply_dynamic_diar(audio, config.SAMPLE_RATE, result, file_path, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
