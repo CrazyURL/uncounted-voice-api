@@ -36,6 +36,10 @@ IT_SECURITY = DomainProfile(
     ),
     confusion_pairs=(
         ("선생님", "수석님"),
+        # D+ : B 프롬프트 폐기하고 DLP 등 IT 약어 오역을 사후(post-STT) 교정으로 흡수.
+        # detect_domain(IT 문맥) 게이트라 family-safe. B 전역 프롬프트 리스크 0.
+        ("DAP", "DLP"),
+        ("파업창", "팝업창"),
     ),
     context_keywords=(
         "보안", "DLP", "NAC", "공동인증서", "회의실",
