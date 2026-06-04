@@ -116,8 +116,29 @@ HANGING_WORD_GAP_SEC = float(os.environ.get("HANGING_WORD_GAP_SEC", "0.3"))
 
 # Gain Normalize 최대 증폭 (노이즈 증폭 방지)
 MAX_GAIN_X = float(os.environ.get("MAX_GAIN_X", "10.0"))
-# 로컬 게인 정규화 최대 증폭 — 글로벌보다 높게 허용하여 조용한 구간의 VAD 감지 개선
-LOCAL_MAX_GAIN_X = float(os.environ.get("LOCAL_MAX_GAIN_X", "30.0"))
+# 로컬 게인 정규화 최대 증폭 — 글로벌보다 높게 허용하여 조용한 구간의 VAD 감지 개선.
+# 2026-06-02: denoise OFF 운영에서 local 30x 가 미세소음을 30배 증폭(noise breathing)
+# 하던 시한폭탄을 완화하기 위해 기본값을 30→10 으로 하향. 근본 해결은 아래
+# loudness_gated_local_gain(LOUDNESS_LOCAL_GATE_ENABLED) 로 noise-floor 게이팅.
+LOCAL_MAX_GAIN_X = float(os.environ.get("LOCAL_MAX_GAIN_X", "10.0"))
+
+# ── 라우드니스 정규화 (EBU R128 / LUFS, 2026-06-02) ──────────────────────────
+# 통화단위 1회 LUFS 측정 → 발화 일괄 적용(발화간 상대음량·다이내믹레인지 보존).
+# 전부 env-gate 기본 OFF — 켜기 전 기존 동작과 동일. 품질측정(quality_grade) 영향
+# 있으므로 canary 실측 후에만 활성화.
+CALL_LOUDNESS_NORM_ENABLED = os.environ.get("CALL_LOUDNESS_NORM_ENABLED", "false").lower() in ("true", "1", "yes")
+CALL_LOUDNESS_TARGET_LUFS = float(os.environ.get("CALL_LOUDNESS_TARGET_LUFS", "-16.0"))   # 음성통화 -16, 방송 -23
+CALL_LOUDNESS_PEAK_DBFS = float(os.environ.get("CALL_LOUDNESS_PEAK_DBFS", "-1.0"))         # true-peak ceiling
+CALL_LOUDNESS_PER_CHUNK = os.environ.get("CALL_LOUDNESS_PER_CHUNK", "true").lower() in ("true", "1", "yes")
+LOUDNESS_ALLOW_ATTENUATE = os.environ.get("LOUDNESS_ALLOW_ATTENUATE", "true").lower() in ("true", "1", "yes")
+LOUDNESS_GAIN_MAX_X = float(os.environ.get("LOUDNESS_GAIN_MAX_X", "0"))                    # 0=무제한(ceiling만)
+LUFS_SILENCE_FLOOR = float(os.environ.get("LUFS_SILENCE_FLOOR", "-70.0"))                  # 이보다 조용하면 측정 skip
+
+# loudness_gated_local_gain — noise-floor 게이팅 로컬 게인(local_normalize_gain 대체)
+LOUDNESS_LOCAL_GATE_ENABLED = os.environ.get("LOUDNESS_LOCAL_GATE_ENABLED", "false").lower() in ("true", "1", "yes")
+LOUDNESS_GATE_DBFS = float(os.environ.get("LOUDNESS_GATE_DBFS", "-50.0"))                  # 절대 noise gate
+NOISE_FLOOR_PERCENTILE = float(os.environ.get("NOISE_FLOOR_PERCENTILE", "10.0"))          # 하위 N%ile = noise floor
+LOUDNESS_GATE_MARGIN = float(os.environ.get("LOUDNESS_GATE_MARGIN", "3.0"))                # noise_floor*margin 미만 → gain=1
 
 # WhisperX 내부 silero VAD 임계값 (낮을수록 조용한 speech 감지 향상)
 # 기본값: onset=0.500, offset=0.363 — 조용한 구간 누락 시 낮춤

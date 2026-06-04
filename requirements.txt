@@ -90,6 +90,7 @@ pyannote-database==6.1.1
 pyannote-metrics==4.0.0
 pyannote-pipeline==4.0.0
 pyannoteai-sdk==0.4.0
+pyloudnorm==0.1.1
 pydantic==2.12.5
 pydantic_core==2.41.5
 Pygments==2.20.0
