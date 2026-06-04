@@ -414,3 +414,82 @@ def mask_segments(
         for label in pattern_order
         if label in type_count_map
     ]
+
+
+def mask_utterance_pii(
+    text: str,
+    words: list,
+    enable_name_masking: bool = False,
+    grade: Optional[CallGrade] = None,
+) -> tuple:
+    """발화(utterance)의 transcript_text 와 words 에 regex PII 마스킹을 동기 적용한다.
+
+    ★Gate-1 근본수정: mask_segments 는 seg["text"] 만 마스킹하지만, 납품물
+    transcript_text/words 는 words 에서 재구성되므로 전화/주민/카드 등 regex PII 가
+    납품 발화에 평문으로 남았다(이름은 ner_guard.mask_utterance 가 처리, regex 는 누락).
+    이름과 달리 전화번호는 여러 word 에 쪼개지므로 span→word 매핑(find_pii_word_ranges
+    와 동일 offset 계산) 후 첫 word 를 [PII_<타입>] 토큰으로, 나머지 겹친 word 는 드롭한다.
+
+    반환: (masked_text, masked_words, summary). immutable — 입력 미변형.
+    """
+    spans = detect_pii_spans(text or "", enable_name_masking, grade)
+    from app.pii_extended import LABEL_KOREAN_NAME_CANDIDATE as _LBL_KN
+    spans = [s for s in spans if s.get("type") != _LBL_KN]
+    if not spans:
+        return text, list(words), {}
+
+    # 1. text 는 mask_pii 의 char-exact 로직 재사용(조사/문장부호 보존).
+    res = mask_pii(text or "", enable_name_masking, grade)
+    masked_text = res["masked_text"]
+    summary = {item["type"]: int(item["count"]) for item in res["pii_detected"]}
+
+    if not words:
+        return masked_text, list(words), summary
+
+    # 2. words offset 계산 (find_pii_word_ranges 와 동일 — 누적 커서로 순차 매칭).
+    current = 0
+    offs: list = []
+    tl = (text or "").lower()
+    for w in words:
+        wt = w.get("word", "") if isinstance(w, dict) else ""
+        if not wt:
+            offs.append((-1, -1)); continue
+        i = tl.find(wt.lower(), current)
+        if i == -1:
+            offs.append((-1, -1)); continue
+        offs.append((i, i + len(wt))); current = i + len(wt)
+
+    # 3. non-overlapping span (mask_pii 와 동일 정렬/중첩제거).
+    sp = sorted(spans, key=lambda x: (x["char_start"], -(x["char_end"] - x["char_start"])))
+    non_overlap: list = []; last = -1
+    for s in sp:
+        if s["char_start"] >= last:
+            non_overlap.append(s); last = s["char_end"]
+
+    # 4. span→word: 첫 word=토큰(시간범위는 마지막 겹친 word 의 end 까지), 나머지=드롭.
+    drop: set = set()
+    token_at: dict = {}
+    for s in non_overlap:
+        ss, se = s["char_start"], s["char_end"]
+        idxs = [k for k, (a, b) in enumerate(offs) if a >= 0 and not (b <= ss or a >= se)]
+        if not idxs:
+            continue
+        token_at[idxs[0]] = (f"[PII_{s['type']}]", idxs[-1])
+        for k in idxs[1:]:
+            drop.add(k)
+
+    new_words: list = []
+    for k, w in enumerate(words):
+        if k in drop:
+            continue
+        if k in token_at:
+            tok, last_idx = token_at[k]
+            nw = dict(w) if isinstance(w, dict) else {"word": tok}
+            nw["word"] = tok
+            lw = words[last_idx]
+            if isinstance(lw, dict) and "end" in lw:
+                nw["end"] = lw["end"]
+            new_words.append(nw)
+        else:
+            new_words.append(w)
+    return masked_text, new_words, summary

@@ -17,7 +17,7 @@ from app.hotword_engine import build_domain_prompt, correct_confusions, get_prof
 from app.text_quality import collapse_segment_repetitions
 from app.ner_guard import mask_utterance
 from app.review_flags_builder import build_utterance_review_flags
-from app.pii_masker import mask_pii, mask_segments
+from app.pii_masker import mask_pii, mask_segments, mask_utterance_pii
 from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
 from app.services.recluster_config import ReclusterConfig
@@ -1131,6 +1131,24 @@ def transcribe(
                         "audio_filename": filename,
                         "words": list(utt.words),
                     })
+                # ★Gate-1 근본수정: regex PII 발화 마스킹 (전화/주민/카드/계좌/이메일/IP).
+                # mask_segments 는 seg.text 만 가리는데 utterance text/words 는 words 에서
+                # 재구성되므로 regex PII 가 납품 발화에 평문 잔존했다(이름은 NER 가 처리). text+words 동기.
+                # env-gate 기본 OFF → byte-identical. mask_pii 요청 시에만 적용.
+                if mask_pii and config.PII_UTTERANCE_MASK_ENABLED:
+                    upii = 0
+                    for u in utterances_result:
+                        mt, mw, summ = mask_utterance_pii(
+                            u["transcript_text"], u["words"], enable_name_masking
+                        )
+                        if summ:
+                            u["transcript_text"] = mt
+                            u["words"] = mw
+                            u["pii_masked"] = True
+                            upii += sum(summ.values())
+                    if upii:
+                        logger.info("[%s] 발화 regex PII 마스킹 %d건", task_id, upii)
+
                 # NER 가드 A형: 풀네임(성+이름) 자동마스킹 (env-gate 기본 OFF → byte-identical).
                 # utterance 는 words 에서 재구성되므로 text+words 둘 다 마스킹(이우주/김현정 누출 방지).
                 if config.NER_GUARD_ENABLED:
