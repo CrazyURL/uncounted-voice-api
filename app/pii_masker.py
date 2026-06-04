@@ -344,21 +344,10 @@ def mask_pii(
         start = span["char_start"]
         end = span["char_end"]
 
-        # 치환값 계산
-        replacer_val = None
-        if label == "이름":
-            s = matched[0]
-            g = matched[1:]
-            replacer_val = f"{s}{'O' * len(g)}"
-        else:
-            for p, r, l in PII_PATTERNS:
-                if l == label:
-                    m = p.fullmatch(matched)
-                    if m:
-                        replacer_val = r(m) if callable(r) else r
-                        break
-            if not replacer_val:
-                replacer_val = "*" * len(matched)
+        # 치환값 = 범주형 토큰 [PII_<타입>] (표준화 2026-06-04).
+        # 기존 부분마스킹(이름 "홍OO" 성씨노출 / 숫자 "010-****-5678" 자릿수노출) 폐기 →
+        # 누출 0 + downstream LLM 타입 보존 + admin UI 타입별 색상 분기.
+        replacer_val = f"[PII_{label}]"
 
         # 치환 적용
         masked_chars[start:end] = list(replacer_val)
