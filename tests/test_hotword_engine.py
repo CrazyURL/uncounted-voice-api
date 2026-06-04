@@ -83,6 +83,19 @@ class TestCorrectConfusions:
         assert n == 1
         assert "수석님이" in out[0]["text"]
 
+    def test_corrects_word_level_for_utterance_rebuild(self):
+        # utterance transcript_text 는 seg["words"] 에서 재구성되므로 워드도 교정돼야 한다
+        # (회귀잠금: 텍스트만 고치면 발화 persist 에 반영 안 됨 — 01dd38b9 실증)
+        segs = [{
+            "text": "DLP 보안 공동인증서 정책 아 선생님",
+            "words": [{"word": "아", "start": 0, "end": 1}, {"word": "선생님", "start": 1, "end": 2}],
+        }]
+        out, n = correct_confusions(segs, IT)
+        assert n >= 1
+        joined = " ".join(w["word"] for w in out[0]["words"])
+        assert "수석님" in joined
+        assert "선생님" not in joined
+
     def test_session_dict_gate_blocks_when_absent(self):
         segs = self._segs("DLP 보안 공동인증서 정책 선생님 결재")
         # 세션사전에 정답어(수석님) 없음 → 미발동
