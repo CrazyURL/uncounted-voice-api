@@ -85,5 +85,14 @@ def correct_confusions(
     for seg in segments:
         new_text, n = _correct_text(seg.get("text", ""), active)
         total += n
-        new_segments.append({**seg, "text": new_text} if n else {**seg})
+        new_seg = {**seg, "text": new_text} if n else {**seg}
+        # 워드 레벨도 교정 — utterance transcript_text 는 seg["words"] 에서 재구성되므로
+        # 텍스트만 고치면 발화 persist 에 반영되지 않는다.
+        words = seg.get("words")
+        if words:
+            new_seg["words"] = [
+                ({**w, "word": _correct_text(w.get("word", ""), active)[0]})
+                for w in words
+            ]
+        new_segments.append(new_seg)
     return new_segments, total
