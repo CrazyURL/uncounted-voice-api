@@ -142,6 +142,10 @@ HOTWORD_ENGINE_DOMAIN = os.environ.get("HOTWORD_ENGINE_DOMAIN", "it_security") o
 # ON 시 utterance 의 풀네임(성+이름)을 [이름] 으로 자동마스킹(text+words).
 NER_GUARD_ENABLED = os.environ.get("NER_GUARD_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# 반복/루프 환각 축약 (Whisper "하는지×4" 결정론적 축약) — 기본 OFF, byte-identical.
+# 설계: docs/design_review_panel_redesign_20260603.md §7. text+words 동기 축약.
+TEXT_QUALITY_REPETITION_ENABLED = os.environ.get("TEXT_QUALITY_REPETITION_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # ─────────────────────────────────────────────────────────────
 # 전처리 파이프라인 단계별 토글 (품질 보존 점진 활성화)
 # Round 1: gain만 ON → Round 2: + silence → Round 3: + denoise → Round 4: + dedup

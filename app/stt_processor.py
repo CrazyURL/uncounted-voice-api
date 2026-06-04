@@ -14,6 +14,7 @@ from whisperx.diarize import DiarizationPipeline
 from app import config
 from app.core.job_store import job_store
 from app.hotword_engine import build_domain_prompt, correct_confusions, get_profile
+from app.text_quality import collapse_segment_repetitions
 from app.ner_guard import mask_utterance
 from app.pii_masker import mask_pii, mask_segments
 from app.services.audio_preprocessor import load_df_model, preprocess
@@ -994,6 +995,13 @@ def transcribe(
                 )
                 if n_hotword_corr:
                     logger.info("[%s] 핫워드 혼동쌍 교정 %d건", task_id, n_hotword_corr)
+
+            # STAGE 14.6: 반복/루프 환각 축약 (env-gate 기본 OFF → byte-identical).
+            # text+words 동기 축약 → full_text(seg.text)/utterance(words) 양쪽 정합.
+            if config.TEXT_QUALITY_REPETITION_ENABLED:
+                segments, n_rep = collapse_segment_repetitions(segments)
+                if n_rep:
+                    logger.info("[%s] 반복환각 축약 %d건", task_id, n_rep)
 
             # 5. 음성 PII 마스킹 (일반 모드)
             # PII 이름 마스킹: 텍스트와 음성을 OR로 동기화 (chunked 모드와 동일 정책).
