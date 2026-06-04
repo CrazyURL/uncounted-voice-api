@@ -82,3 +82,51 @@ def utterance_overlap_features(
         "overlap_ratio": ratio,
         "overlap_intervals": intervals,
     }
+
+
+def overlap_regions_from_diarization(
+    segments: Any,
+    cutoff_sec: float = DEFAULT_CUTOFF_SEC,
+) -> list[tuple[float, float]]:
+    """Compute cross-talk regions from the MAIN diarization pass — 0 extra GPU.
+
+    ``segments``: iterable of ``(start, end, speaker)``. The whisperx diarization
+    DataFrame is built from ``DiarizeOutput.speaker_diarization.itertracks()``
+    (the OVERLAP-AWARE annotation), so it already contains overlapping tracks.
+    Pairwise time-intersection of DIFFERENT-speaker tracks (>= ``cutoff_sec``)
+    recovers true overlap without a second inference (no OOM risk). Returns merged
+    ``[(start, end), ...]``.
+    """
+    segs = sorted(
+        (
+            (float(s), float(e), spk)
+            for s, e, spk in segments
+            if s is not None and e is not None and float(e) > float(s)
+        ),
+        key=lambda x: x[0],
+    )
+    raw: list[tuple[float, float]] = []
+    n = len(segs)
+    for i in range(n):
+        s1, e1, sp1 = segs[i]
+        for j in range(i + 1, n):
+            s2, e2, sp2 = segs[j]
+            if s2 >= e1:
+                break  # sorted by start → no later segment overlaps segs[i]
+            if sp1 == sp2:
+                continue
+            os_ = s1 if s1 > s2 else s2
+            oe = e1 if e1 < e2 else e2
+            if oe - os_ >= cutoff_sec:
+                raw.append((os_, oe))
+    if not raw:
+        return []
+    raw.sort()
+    merged: list[list[float]] = [list(raw[0])]
+    for s, e in raw[1:]:
+        if s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]

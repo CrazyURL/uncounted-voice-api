@@ -539,37 +539,38 @@ def _transcribe_with_oom_guard(audio, task_id: str) -> dict:
             logger.info("[%s] OOM fallback → batch_size=%d", task_id, current)
 
 
-def _maybe_attach_overlap(audio, sample_rate, utterances, task_id):
+def _maybe_attach_overlap(diarize_segments, utterances, task_id):
     """Task 5 — 화자중첩(overlap) 탐지 hook (env-gated, 무중단 fallback).
 
-    OVERLAP_DETECTION_ENABLED=true 일 때만 동작. pyannote overlap-aware annotation
-    (get_overlap)으로 동시발화 구간을 구해 utterance 별 메타를 부착한다.
-    실패/미가용/청크모드(audio None) 시 utterances 무변경(파이프라인 무중단).
-    v1: _diarize_model 내부 pyannote pipeline 을 재사용(모델 추가로드 없음)해 별도
-    diarization pass 1회 수행. 추후 메인 pass annotation 캡처로 중복추론 제거 가능.
+    OVERLAP_DETECTION_ENABLED=true 일 때만 동작. ★메인 diarization pass 의 결과
+    (diarize_segments)를 재사용해 동시발화 구간을 구한다 — 추가 GPU 추론 0회(OOM 위험
+    제거). whisperx df 는 overlap-aware annotation(speaker_diarization.itertracks)으로
+    만들어져 중첩 트랙을 포함하므로, 다른 화자 트랙의 시간 교차로 진짜 중첩을 복원한다.
+    diarize_segments None(미분리/청크) / 실패 시 utterances 무변경(무중단).
     """
-    if not config.OVERLAP_DETECTION_ENABLED or not utterances or audio is None:
+    if not config.OVERLAP_DETECTION_ENABLED or not utterances or diarize_segments is None:
         return
     try:
         from app.services.overlap_detection import (
-            extract_overlap_regions,
+            overlap_regions_from_diarization,
             utterance_overlap_features,
         )
 
-        pmodel = getattr(_diarize_model, "model", None)
-        if pmodel is None:
-            logger.warning("[%s] overlap: pyannote pipeline 미접근 — skip", task_id)
-            return
-        wav = torch.from_numpy(audio).float().unsqueeze(0)
-        diar = pmodel({"waveform": wav, "sample_rate": sample_rate})
-        regions = extract_overlap_regions(diar, cutoff_sec=config.OVERLAP_CUTOFF_SEC)
+        # diarize_segments: whisperx DataFrame 또는 (df, embeddings) tuple
+        df = diarize_segments[0] if isinstance(diarize_segments, tuple) else diarize_segments
+        if hasattr(df, "itertuples"):  # pandas DataFrame (start/end/speaker 컬럼)
+            seg_list = [(r.start, r.end, r.speaker) for r in df.itertuples(index=False)]
+        else:  # list[dict] fallback
+            seg_list = [(d.get("start"), d.get("end"), d.get("speaker")) for d in df]
+
+        regions = overlap_regions_from_diarization(seg_list, cutoff_sec=config.OVERLAP_CUTOFF_SEC)
         for utt in utterances:
             utt.update(utterance_overlap_features(
                 utt.get("start_sec"), utt.get("end_sec"), regions,
             ))
         flagged = sum(1 for u in utterances if u.get("is_overlapping"))
         logger.info(
-            "[%s] overlap 탐지 완료: regions=%d flagged=%d/%d (cutoff=%.2fs)",
+            "[%s] overlap(메인pass 재사용·0GPU): regions=%d flagged=%d/%d (cutoff=%.2fs)",
             task_id, len(regions), flagged, len(utterances), config.OVERLAP_CUTOFF_SEC,
         )
     except Exception as e:  # noqa: BLE001
@@ -889,6 +890,9 @@ def transcribe(
         pii_audio_ranges: list[tuple[float, float, str]] = []
         pre_mask_texts_by_speaker: dict[str, list[str]] = {}
         speakers_result: list[dict] | None = None
+        # Task 5 overlap: 메인 diarization 결과 재사용용. non-chunked diarize 에서 set,
+        # chunked/미분리면 None 유지 → _maybe_attach_overlap skip (NameError 방지).
+        diarize_segments = None
 
         if use_chunked:
             # ── 청크 모드: 대용량 오디오 ──
@@ -1181,8 +1185,9 @@ def transcribe(
                 u["dialog_act_confidence"] = lbl.dialog_act_confidence
                 u["auto_label_model_version"] = lbl.model_version
 
-        # Task 5: 화자중첩(overlap) 메타 부착 (env-gated, 무중단 fallback)
-        _maybe_attach_overlap(audio, config.SAMPLE_RATE, utterances_result, task_id)
+        # Task 5: 화자중첩(overlap) 메타 부착 (env-gated, 무중단) — 메인 diarization
+        # 결과(diarize_segments) 재사용, 추가 GPU 추론 0회.
+        _maybe_attach_overlap(diarize_segments, utterances_result, task_id)
 
         # STAGE 16: 주제 세그먼트 탐지 (발화가 3개 이상일 때만 의미 있음)
         topic_segments_result: list[dict] | None = None

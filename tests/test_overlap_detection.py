@@ -4,8 +4,45 @@ from types import SimpleNamespace
 from app.services.overlap_detection import (
     DEFAULT_CUTOFF_SEC,
     extract_overlap_regions,
+    overlap_regions_from_diarization,
     utterance_overlap_features,
 )
+
+
+# ── overlap_regions_from_diarization (0-GPU, 메인 df 재사용) ──────────────
+
+def test_diar_two_speakers_overlap():
+    # 다른 화자 두 세그먼트가 1.0s 겹침 → 1 region
+    segs = [(0.0, 3.0, "A"), (2.0, 5.0, "B")]
+    assert overlap_regions_from_diarization(segs, cutoff_sec=0.2) == [(2.0, 3.0)]
+
+
+def test_diar_same_speaker_no_overlap():
+    # 같은 화자 겹침은 cross-talk 아님 → 무시
+    segs = [(0.0, 3.0, "A"), (2.0, 5.0, "A")]
+    assert overlap_regions_from_diarization(segs, cutoff_sec=0.2) == []
+
+
+def test_diar_below_cutoff_dropped():
+    segs = [(0.0, 2.1, "A"), (2.0, 4.0, "B")]  # 0.1s 겹침 < 0.2
+    assert overlap_regions_from_diarization(segs, cutoff_sec=0.2) == []
+
+
+def test_diar_no_overlap():
+    segs = [(0.0, 2.0, "A"), (2.0, 4.0, "B")]  # 인접, 겹침 0
+    assert overlap_regions_from_diarization(segs, cutoff_sec=0.2) == []
+
+
+def test_diar_merges_adjacent_regions():
+    # 두 겹침 구간이 인접/연속 → 병합
+    segs = [(0.0, 3.0, "A"), (2.0, 6.0, "B"), (2.5, 7.0, "A")]
+    out = overlap_regions_from_diarization(segs, cutoff_sec=0.2)
+    assert len(out) == 1
+    assert out[0][0] == 2.0 and out[0][1] >= 6.0
+
+
+def test_diar_empty():
+    assert overlap_regions_from_diarization([], cutoff_sec=0.2) == []
 
 
 def _seg(start, end):
