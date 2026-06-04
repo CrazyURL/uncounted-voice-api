@@ -137,6 +137,11 @@ HOTWORD_ENGINE_ENABLED = os.environ.get("HOTWORD_ENGINE_ENABLED", "false").lower
 HOTWORD_ENGINE_PROMPT_DOMAIN = os.environ.get("HOTWORD_ENGINE_PROMPT_DOMAIN", "") or ""
 HOTWORD_ENGINE_DOMAIN = os.environ.get("HOTWORD_ENGINE_DOMAIN", "it_security") or "it_security"
 
+# NER 가드 (정적 사전 PII 이름 자동마스킹) — 기본 OFF, byte-identical.
+# 설계: docs/design_review_panel_redesign_20260603.md §6
+# ON 시 utterance 의 풀네임(성+이름)을 [이름] 으로 자동마스킹(text+words).
+NER_GUARD_ENABLED = os.environ.get("NER_GUARD_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # ─────────────────────────────────────────────────────────────
 # 전처리 파이프라인 단계별 토글 (품질 보존 점진 활성화)
 # Round 1: gain만 ON → Round 2: + silence → Round 3: + denoise → Round 4: + dedup
