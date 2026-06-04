@@ -129,6 +129,14 @@ VAD_OFFSET = float(os.environ.get("VAD_OFFSET", "0.100"))
 HOTWORDS = os.environ.get("HOTWORDS", None)
 INITIAL_PROMPT = os.environ.get("INITIAL_PROMPT", None)
 
+# 도메인 핫워드 엔진 (B+D) — 기본 OFF, byte-identical.
+# 설계: docs/design_review_panel_redesign_20260603.md §5
+# HOTWORD_ENGINE_ENABLED: D(혼동쌍 후처리 교정) 게이트
+# HOTWORD_ENGINE_PROMPT_DOMAIN: 비면 B(발음페어링 프롬프트) OFF. 예 "it_security"
+HOTWORD_ENGINE_ENABLED = os.environ.get("HOTWORD_ENGINE_ENABLED", "false").lower() in ("true", "1", "yes")
+HOTWORD_ENGINE_PROMPT_DOMAIN = os.environ.get("HOTWORD_ENGINE_PROMPT_DOMAIN", "") or ""
+HOTWORD_ENGINE_DOMAIN = os.environ.get("HOTWORD_ENGINE_DOMAIN", "it_security") or "it_security"
+
 # ─────────────────────────────────────────────────────────────
 # 전처리 파이프라인 단계별 토글 (품질 보존 점진 활성화)
 # Round 1: gain만 ON → Round 2: + silence → Round 3: + denoise → Round 4: + dedup

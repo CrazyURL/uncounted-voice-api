@@ -13,6 +13,7 @@ from whisperx.diarize import DiarizationPipeline
 
 from app import config
 from app.core.job_store import job_store
+from app.hotword_engine import build_domain_prompt, correct_confusions, get_profile
 from app.pii_masker import mask_pii, mask_segments
 from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
@@ -590,9 +591,15 @@ def load_models():
     if config.HOTWORDS:
         asr_options["hotwords"] = config.HOTWORDS
         logger.info("Hotwords 설정: %s", config.HOTWORDS)
-    if config.INITIAL_PROMPT:
-        asr_options["initial_prompt"] = config.INITIAL_PROMPT
-        logger.info("Initial prompt 설정: %s", config.INITIAL_PROMPT[:50])
+    # B: 도메인 발음페어링 부착 (env-gate 기본 OFF → config.INITIAL_PROMPT 그대로).
+    initial_prompt = config.INITIAL_PROMPT
+    if config.HOTWORD_ENGINE_PROMPT_DOMAIN:
+        initial_prompt = build_domain_prompt(
+            initial_prompt, get_profile(config.HOTWORD_ENGINE_PROMPT_DOMAIN)
+        )
+    if initial_prompt:
+        asr_options["initial_prompt"] = initial_prompt
+        logger.info("Initial prompt 설정: %s", initial_prompt[:50])
 
     _model = whisperx.load_model(
         config.MODEL_SIZE,
@@ -977,6 +984,15 @@ def transcribe(
 
             segments = _clean_segments(result["segments"])
             diarize_active = enable_diarize and _diarize_model is not None
+
+            # STAGE 14.5: 도메인 혼동쌍 교정 (B+D 핫워드 엔진, env-gate 기본 OFF → byte-identical).
+            # family-safe: 문맥(도메인 키워드<min) 미충족 시 무변경. PII/관계탐지 전에 적용.
+            if config.HOTWORD_ENGINE_ENABLED:
+                segments, n_hotword_corr = correct_confusions(
+                    segments, get_profile(config.HOTWORD_ENGINE_DOMAIN)
+                )
+                if n_hotword_corr:
+                    logger.info("[%s] 핫워드 혼동쌍 교정 %d건", task_id, n_hotword_corr)
 
             # 5. 음성 PII 마스킹 (일반 모드)
             # PII 이름 마스킹: 텍스트와 음성을 OR로 동기화 (chunked 모드와 동일 정책).
