@@ -47,7 +47,7 @@ def detect_name_hits(text: str) -> list[NameHit]:
     return hits
 
 
-def auto_mask_names(text: str, mask_token: str = "[이름]") -> tuple[str, list[NameHit]]:
+def auto_mask_names(text: str, mask_token: str = "[PII_이름]") -> tuple[str, list[NameHit]]:
     """풀네임(고확신)만 자동 마스킹. 호격은 건드리지 않고 플래그로만 반환.
 
     반환: (마스킹된 텍스트, 전체 NameHit 목록[full+vocative]).
@@ -72,7 +72,7 @@ def review_flags(text: str) -> list[NameHit]:
     return [h for h in detect_name_hits(text) if h.kind == "vocative"]
 
 
-def mask_utterance(text: str, words: list[dict], mask_token: str = "[이름]"):
+def mask_utterance(text: str, words: list[dict], mask_token: str = "[PII_이름]"):
     """utterance용 A형 자동마스킹: transcript_text + words 동기화.
 
     utterance.transcript_text 가 words 에서 재구성되므로 text·words 둘 다 마스킹해야

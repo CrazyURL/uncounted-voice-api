@@ -16,14 +16,14 @@ from app.ner_guard import (
 class TestFullNameAutoMask:
     def test_masks_real_full_name(self):
         out, hits = auto_mask_names("김지민 책임님이 요청주신거거든요")
-        assert "[이름]" in out
+        assert "[PII_이름]" in out
         assert "김지민" not in out
         assert any(h.kind == "full" for h in hits)
 
     def test_preserves_particle(self):
-        # 토큰 내 조사는 보존 — "김현정이" → "[이름]이"
+        # 토큰 내 조사는 보존 — "김현정이" → "[PII_이름]이"
         out, _ = auto_mask_names("김현정이 검색해볼까")
-        assert "[이름]이" in out
+        assert "[PII_이름]이" in out
 
     @pytest.mark.parametrize("noun", ["공인인증서님이", "공영주차장에서", "영수증 발급", "이유식 먹였어", "김해시청입니다"])
     def test_no_false_positive_on_common_nouns(self, noun):
@@ -34,7 +34,7 @@ class TestFullNameAutoMask:
 
     def test_multiple_names(self):
         out, hits = auto_mask_names("이영희 고객님과 박서연 사원")
-        assert out.count("[이름]") == 2
+        assert out.count("[PII_이름]") == 2
 
 
 class TestVocativeReviewFlag:
