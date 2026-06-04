@@ -17,7 +17,7 @@ from app.hotword_engine import build_domain_prompt, correct_confusions, get_prof
 from app.text_quality import collapse_segment_repetitions
 from app.ner_guard import mask_utterance
 from app.review_flags_builder import build_utterance_review_flags
-from app.pii_masker import mask_pii, mask_segments, mask_utterance_pii
+from app.pii_masker import mask_pii, mask_segments, mask_utterance_pii, CORE_PII_LABELS
 from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
 from app.services.recluster_config import ReclusterConfig
@@ -808,7 +808,9 @@ def _transcribe_chunked(
                 )
                 if chunk_pii_ranges:
                     if mask_audio_pii:
-                        chunk_audio = mask_audio_ranges(chunk_audio, chunk_pii_ranges, config.SAMPLE_RATE)
+                        beep_ranges = [r for r in chunk_pii_ranges if r[2] in CORE_PII_LABELS]
+                        if beep_ranges:
+                            chunk_audio = mask_audio_ranges(chunk_audio, beep_ranges, config.SAMPLE_RATE)
                     # 글로벌 타임라인으로 변환하여 저장 (beep 여부와 무관하게 range 기록)
                     for s, e, t in chunk_pii_ranges:
                         all_pii_audio_ranges.append((
@@ -1018,8 +1020,11 @@ def transcribe(
                     pad_sec=config.PII_MASK_PAD_SEC,
                 )
                 if pii_audio_ranges and mask_audio_pii:
-                    audio = mask_audio_ranges(audio, pii_audio_ranges, config.SAMPLE_RATE)
-                    logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간)", task_id, len(pii_audio_ranges))
+                    # 비프는 고정밀 PII(CORE)만 — 이름·extended numeric 제외(오디오 변형 비가역).
+                    beep_ranges = [r for r in pii_audio_ranges if r[2] in CORE_PII_LABELS]
+                    if beep_ranges:
+                        audio = mask_audio_ranges(audio, beep_ranges, config.SAMPLE_RATE)
+                        logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간, CORE)", task_id, len(beep_ranges))
 
         # STAGE 15: PII 마스킹 전 화자별 텍스트 스냅샷 (호칭어 기반 관계 탐지용)
         # mask_segments()가 segments 텍스트를 in-place 치환하므로 그 전에 수집해야 한다.

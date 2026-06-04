@@ -184,6 +184,10 @@ PII_PATTERNS = [
     ),
 ]
 
+# 고정밀 PII 라벨(PII_PATTERNS) — 오디오 비프 대상(이름·extended numeric 제외).
+# 오디오 변형은 되돌릴 수 없어 텍스트 마스킹보다 보수적으로(고정밀 패턴만) 적용한다.
+CORE_PII_LABELS = frozenset(label for _, _, label in PII_PATTERNS)
+
 
 def _matches_exclude_prefix(surname: str, given: str) -> bool:
     """성+이름이 제외 목록의 접두사와 일치하는지 확인한다.

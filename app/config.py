@@ -146,6 +146,11 @@ NER_GUARD_ENABLED = os.environ.get("NER_GUARD_ENABLED", "false").lower() in ("tr
 # 설계: docs/design_review_panel_redesign_20260603.md §7. text+words 동기 축약.
 TEXT_QUALITY_REPETITION_ENABLED = os.environ.get("TEXT_QUALITY_REPETITION_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# ★Gate-1: 오디오 PII 비프(1kHz) — 발화 WAV의 PII 음성 마스킹. 기본 OFF.
+# ON 시 worker 가 mask_audio_pii=true 요청 → 저장 WAV 자체가 깨끗(export 경로 무관 fail-safe).
+# 비프 대상은 CORE_PII_LABELS(고정밀)만 — 오디오 변형은 되돌릴 수 없어 보수적.
+PII_AUDIO_MASK_ENABLED = os.environ.get("PII_AUDIO_MASK_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # ★Gate-1: regex PII(전화/주민/카드 등) 발화(utterance) text+words 마스킹 — 기본 OFF.
 # mask_segments 는 seg.text 만 가려 words 재구성 발화에 평문 누출 → 이 게이트로 근본수정.
 PII_UTTERANCE_MASK_ENABLED = os.environ.get("PII_UTTERANCE_MASK_ENABLED", "false").lower() in ("true", "1", "yes")

@@ -174,22 +174,30 @@ async def download_raw_audio(raw_audio_url: str) -> str:
 # ── Voice API ─────────────────────────────────────────────────────────
 
 def build_submit_params() -> dict:
-    """voice-api /transcribe 요청 query params. D4b: pii_intervals_only 만 추가하고
-    mask_audio_pii(D5 비프)는 전달하지 않는다(voice-api 기본 false 유지)."""
-    return {
+    """voice-api /transcribe 요청 query params.
+
+    pii_intervals_only 는 항상 보내 시간범위 메타데이터를 산출한다.
+    PII_AUDIO_MASK_ENABLED 게이트 ON 시 mask_audio_pii 도 추가해 저장 발화 WAV 자체에
+    1kHz 비프를 입힌다(Gate-1 fail-safe — export 경로와 무관하게 음성 PII 제거).
+    비프 대상은 voice-api 측에서 CORE_PII_LABELS(고정밀)만으로 필터된다.
+    """
+    from app import config as _cfg
+    params = {
         "language": "ko",
         "diarize": "true",
         "split_by_utterance": "true",
         "split_by_speaker": "true",
         "mask_pii": "true",
         # 한국어 이름 마스킹(텍스트). voice-api 의 enable_name_masking 기본값은 false 라
-        # 명시하지 않으면 성씨+이름 패턴이 감지되지 않는다(transcript 평문 노출). D4b 텍스트
-        # 마스킹 경로이며 오디오는 변형하지 않는다(mask_audio_names=D5 비프와 무관).
+        # 명시하지 않으면 성씨+이름 패턴이 감지되지 않는다(transcript 평문 노출).
         "enable_name_masking": "true",
         "denoise": "true",
-        # PII 시간범위 메타데이터만 산출(오디오 미변형). 저장 발화 WAV 원본 유지.
+        # PII 시간범위 메타데이터(항상 산출).
         "pii_intervals_only": "true",
     }
+    if _cfg.PII_AUDIO_MASK_ENABLED:
+        params["mask_audio_pii"] = "true"
+    return params
 
 
 async def submit_to_voice_api(audio_path: str) -> str:
