@@ -10,6 +10,7 @@ from app.ner_guard.detector import (
     NameHit,
     auto_mask_names,
     detect_name_hits,
+    mask_utterance,
     review_flags,
 )
 from app.ner_guard.honorific_guard import detect_inanimate_honorific
@@ -18,6 +19,7 @@ __all__ = [
     "NameHit",
     "auto_mask_names",
     "detect_name_hits",
+    "mask_utterance",
     "review_flags",
     "detect_inanimate_honorific",
 ]

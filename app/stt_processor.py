@@ -14,6 +14,7 @@ from whisperx.diarize import DiarizationPipeline
 from app import config
 from app.core.job_store import job_store
 from app.hotword_engine import build_domain_prompt, correct_confusions, get_profile
+from app.ner_guard import mask_utterance
 from app.pii_masker import mask_pii, mask_segments
 from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
@@ -1121,6 +1122,19 @@ def transcribe(
                         "audio_filename": filename,
                         "words": list(utt.words),
                     })
+                # NER 가드 A형: 풀네임(성+이름) 자동마스킹 (env-gate 기본 OFF → byte-identical).
+                # utterance 는 words 에서 재구성되므로 text+words 둘 다 마스킹(이우주/김현정 누출 방지).
+                if config.NER_GUARD_ENABLED:
+                    ner_masked = 0
+                    for u in utterances_result:
+                        mt, mw, n, _ = mask_utterance(u["transcript_text"], u["words"])
+                        if n:
+                            u["transcript_text"] = mt
+                            u["words"] = mw
+                            u["pii_name_masked"] = True
+                            ner_masked += n
+                    if ner_masked:
+                        logger.info("[%s] NER 가드 풀네임 자동마스킹 %d건", task_id, ner_masked)
                 logger.info("[%s] 발화 %d개 분리 완료", task_id, len(utterances_result))
 
             if split_by_speaker:

@@ -70,3 +70,25 @@ def auto_mask_names(text: str, mask_token: str = "[이름]") -> tuple[str, list[
 def review_flags(text: str) -> list[NameHit]:
     """검수 플래그 후보(호격 = 저우선). 풀네임은 자동마스킹되므로 제외."""
     return [h for h in detect_name_hits(text) if h.kind == "vocative"]
+
+
+def mask_utterance(text: str, words: list[dict], mask_token: str = "[이름]"):
+    """utterance용 A형 자동마스킹: transcript_text + words 동기화.
+
+    utterance.transcript_text 가 words 에서 재구성되므로 text·words 둘 다 마스킹해야
+    납품 데이터에 실명이 남지 않는다(이우주/김현정 누출 근본원인).
+    반환: (masked_text, masked_words, n_masked, all_hits). immutable.
+    """
+    masked_text, hits = auto_mask_names(text, mask_token)
+    full_names = {h.text for h in hits if h.kind == "full"}
+    if not full_names:
+        return text, list(words), 0, hits
+    new_words = []
+    for w in words:
+        wt = w.get("word", "")
+        new_wt = wt
+        for nm in full_names:
+            if nm in _HANGUL.sub("", new_wt):
+                new_wt = re.sub(re.escape(nm), mask_token, new_wt)
+        new_words.append({**w, "word": new_wt} if new_wt != wt else w)
+    return masked_text, new_words, len(full_names), hits
