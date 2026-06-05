@@ -12,6 +12,7 @@ import numpy as np
 ap = argparse.ArgumentParser()
 ap.add_argument("--limit", type=int, default=0); ap.add_argument("--apply", action="store_true")
 ap.add_argument("--cpu", action="store_true")
+ap.add_argument("--session", default="", help="특정 session_id 만 백필(단건 검증). 비우면 전역.")
 args = ap.parse_args()
 if args.cpu: os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
@@ -79,7 +80,8 @@ def va(sp):
 lim = args.limit if args.limit else 1000
 done = 0; off = 0; vals = []
 while True:
-    rows = GET(f"utterances?select=id,storage_path&storage_path=not.is.null&emotion_valence=is.null&order=id.asc&limit={lim}" + (f"&offset={off}" if not args.limit else ""))
+    sess = f"&session_id=eq.{args.session}" if args.session else ""
+    rows = GET(f"utterances?select=id,storage_path&storage_path=not.is.null&emotion_valence=is.null{sess}&order=id.asc&limit={lim}" + (f"&offset={off}" if not args.limit else ""))
     if not rows: break
     for u in rows:
         try:
