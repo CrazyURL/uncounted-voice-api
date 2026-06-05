@@ -25,12 +25,37 @@ H = {"apikey": K, "Authorization": "Bearer " + K, "Content-Type": "application/j
 def GET(p): return json.load(urllib.request.urlopen(urllib.request.Request(U + "/rest/v1/" + p, headers=H), timeout=60))
 def PATCH(p, b): return urllib.request.urlopen(urllib.request.Request(U + "/rest/v1/" + p, data=json.dumps(b).encode(), method="PATCH", headers=H), timeout=20).status
 
-import torch
-from transformers import Wav2Vec2Processor, AutoModelForAudioClassification
+import torch, torch.nn as nn
+from transformers import Wav2Vec2Processor
+from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Vec2PreTrainedModel
 MODEL = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"  # arousal/dominance/valence
+
+# ★audeering 커스텀 회귀 구조(모델카드). AutoModelForAudioClassification 은 헤드를 못 읽어
+# 랜덤초기화(출력 쓰레기)됨 — 반드시 이 커스텀 클래스로 로드해야 회귀 헤드가 실린다.
+class _RegressionHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.final_dropout)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+    def forward(self, x):
+        x = self.dropout(x); x = torch.tanh(self.dense(x)); x = self.dropout(x)
+        return self.out_proj(x)
+
+class _EmotionModel(Wav2Vec2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.wav2vec2 = Wav2Vec2Model(config)
+        self.classifier = _RegressionHead(config)
+        self.init_weights()
+    def forward(self, input_values):
+        h = self.wav2vec2(input_values)[0]
+        h = torch.mean(h, dim=1)
+        return self.classifier(h)
+
 dev = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
 proc = Wav2Vec2Processor.from_pretrained(MODEL)
-model = AutoModelForAudioClassification.from_pretrained(MODEL).to(dev).eval()
+model = _EmotionModel.from_pretrained(MODEL).to(dev).eval()
 print(f"audeering V-A 모델 로드 OK (device={dev})")
 
 import app.worker as W, boto3, soundfile as sf
@@ -47,7 +72,7 @@ def va(sp):
         import torchaudio; a = torchaudio.functional.resample(torch.tensor(a, dtype=torch.float32), sr, 16000).numpy()
     inp = proc(a, sampling_rate=16000, return_tensors="pt").input_values.to(dev)
     with torch.no_grad():
-        out = model(inp).logits.squeeze().cpu().numpy()  # [arousal, dominance, valence] 0~1
+        out = model(inp).squeeze().cpu().numpy()  # [arousal, dominance, valence] 0~1
     aro, dom, val = float(out[0]), float(out[1]), float(out[2])
     return val * 2 - 1, aro, dom  # valence -1~+1, arousal/dominance 0~1
 
