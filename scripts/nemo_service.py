@@ -73,6 +73,8 @@ def _embed(audio: np.ndarray, sr: int) -> list[float] | None:
 class DiarizeRequest(BaseModel):
     audio_path: str
     window_seconds: float = 30.0   # PoC sweet spot
+    num_speakers: int | None = 2   # None → oracle 끄고 자동추정(IVR 제외용). 기본 2 = 기존 동작.
+    max_num_speakers: int = 4      # 자동추정 상한(IVR+상담사+고객+여유). num_speakers 지정 시 무시.
 
 
 @app.get("/health")
@@ -97,11 +99,13 @@ def diarize_intro(req: DiarizeRequest):
     sf.write(slice_wav, intro, sr)
 
     try:
+        # num_speakers=None → 자동추정(oracle off, max_num_speakers 상한). 지정 시 강제(oracle on).
+        use_oracle = req.num_speakers is not None
         manifest = os.path.join(task_dir, "manifest.json")
         with open(manifest, "w") as f:
             f.write(json.dumps({
                 "audio_filepath": slice_wav, "offset": 0, "duration": None,
-                "label": "infer", "text": "-", "num_speakers": 2,
+                "label": "infer", "text": "-", "num_speakers": req.num_speakers,
                 "rttm_filepath": None, "uem_filepath": None,
             }) + "\n")
 
@@ -110,7 +114,9 @@ def diarize_intro(req: DiarizeRequest):
         cfg.verbose = False
         cfg.diarizer.manifest_filepath = manifest
         cfg.diarizer.out_dir = task_dir
-        cfg.diarizer.clustering.parameters.oracle_num_speakers = True
+        cfg.diarizer.clustering.parameters.oracle_num_speakers = use_oracle
+        if not use_oracle:
+            cfg.diarizer.clustering.parameters.max_num_speakers = int(req.max_num_speakers)
         cfg.diarizer.ignore_overlap = False
 
         from nemo.collections.asr.models import ClusteringDiarizer

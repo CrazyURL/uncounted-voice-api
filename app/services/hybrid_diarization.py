@@ -255,8 +255,13 @@ def _nemo_f0_from_audio(audio_path: str, nemo_turns: list[dict]) -> dict[str, fl
     return _f0_medians_from_segments(audio, int(sr), by_spk)
 
 
-def _call_nemo(audio_path: str, window_sec: float) -> dict | None:
-    """NeMo 마이크로서비스 호출. 실패 시 None(fallback)."""
+def _call_nemo(
+    audio_path: str, window_sec: float, num_speakers: int | None = 2,
+) -> dict | None:
+    """NeMo 마이크로서비스 호출. 실패 시 None(fallback).
+
+    num_speakers=None → 서비스가 oracle 끄고 자동추정(IVR 제외용). 기본 2 = 기존 동작.
+    """
     try:
         import requests
     except ImportError:
@@ -265,7 +270,11 @@ def _call_nemo(audio_path: str, window_sec: float) -> dict | None:
     try:
         resp = requests.post(
             _nemo_endpoint(),
-            json={"audio_path": audio_path, "window_seconds": window_sec},
+            json={
+                "audio_path": audio_path,
+                "window_seconds": window_sec,
+                "num_speakers": num_speakers,
+            },
             timeout=float(os.environ.get("VOICE_HYBRID_NEMO_TIMEOUT", "60")),
         )
         resp.raise_for_status()

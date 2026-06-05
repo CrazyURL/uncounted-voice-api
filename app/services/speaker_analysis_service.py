@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 
 _COSINE_THRESHOLD = float(os.environ.get("SPEAKER_EMBED_COSINE_THRESHOLD", "0.75"))
 
+# 비대화 화자(IVR/ARS 안내멘트) 라벨 — self/관계 추정 대상에서 제외한다.
+# 단일 소스 of truth = app.services.nemo_full_diarization._IVR_LABEL("SPEAKER_IVR").
+# 임포트 체인(hybrid/anchor) 로딩을 피하려 리터럴을 미러링(값 변경 시 양쪽 동기).
+_NON_HUMAN_LABELS = frozenset({"SPEAKER_IVR"})
+
+
+def _is_human(label: object) -> bool:
+    """대화 참여 화자 여부. IVR 등 비대화 라벨은 self/관계 후보에서 배제."""
+    return isinstance(label, str) and label not in _NON_HUMAN_LABELS
+
 # ── 호칭어 → 관계 매핑 ─────────────────────────────────────────────────────
 _SALUTATION_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"엄마|어머니|어머님|모친"), "부모"),
@@ -262,6 +272,8 @@ def analyze_speakers(
     speaker_similarity: dict[str, float] = {}
     if ref_emb is not None and embedding_model is not None:
         for lbl in speaker_labels:
+            if not _is_human(lbl):
+                continue  # IVR 등 비대화 화자는 self 매칭 대상 아님
             chunk = _extract_speaker_audio(audio, sample_rate, segments, lbl)
             if len(chunk) < sample_rate * 0.5:
                 logger.debug("[speaker_analysis] %s 오디오 너무 짧음 — 임베딩 skip", lbl)
@@ -289,10 +301,13 @@ def analyze_speakers(
                 self_label, speaker_similarity[best_lbl],
             )
 
-    if self_label is None and speaker_duration:
-        self_label = max(speaker_duration, key=speaker_duration.__getitem__)
-        role_source = "heuristic"
-        logger.info("[speaker_analysis] heuristic self: %s (dur=%.1fs)", self_label, speaker_duration[self_label])
+    if self_label is None:
+        # 최장 발화 휴리스틱은 사람 화자만 후보로(IVR 안내멘트가 사람보다 길어도 self 오선택 방지).
+        human_duration = {l: d for l, d in speaker_duration.items() if _is_human(l)}
+        if human_duration:
+            self_label = max(human_duration, key=human_duration.__getitem__)
+            role_source = "heuristic"
+            logger.info("[speaker_analysis] heuristic self: %s (dur=%.1fs)", self_label, human_duration[self_label])
 
     results: dict[str, SpeakerAnalysisResult] = {}
     for lbl in speaker_labels:
@@ -301,10 +316,11 @@ def analyze_speakers(
         gender, voice_age = _detect_gender_and_voice_age(chunk, sample_rate)
 
         pre_texts = pre_mask_texts_by_speaker.get(lbl, [])
-        # 관계 추정은 other 화자에만 부여. LLM 경로는 양쪽 대화 전체를 맥락으로 사용.
+        # 관계 추정은 other '사람' 화자에만 부여(IVR 안내멘트는 관계 대상 아님).
+        # LLM 경로는 양쪽 대화 전체를 맥락으로 사용.
         relation = (
             _detect_relation(pre_texts, pre_mask_texts_by_speaker)
-            if role == "other" else None
+            if role == "other" and _is_human(lbl) else None
         )
         speech_age, speech_age_ver = _detect_speech_age(pre_texts) if pre_texts else (None, None)
 
