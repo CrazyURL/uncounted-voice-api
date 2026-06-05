@@ -50,11 +50,11 @@ ORPHAN_CLEANUP_ENABLED = resolve_orphan_cleanup_enabled()
 ORPHAN_CLEANUP_DRY_RUN = resolve_orphan_cleanup_dry_run()
 ORPHAN_CLEANUP_MIN_RATIO = resolve_orphan_cleanup_min_ratio()
 
-# D4b: worker 는 voice-api 에 pii_intervals_only 만 요청한다(시간범위 메타데이터만 산출,
-# 1kHz 비프 미적용 → 저장 발화 WAV 원본 유지). mask_audio_pii(D5 음향 마스킹)는 요청하지 않음.
-# 저장 WAV 가 마스킹되지 않았으므로 persist 되는 pii_intervals 의 maskType 은 "text_only"
-# (텍스트만 마스킹, 오디오 원본, 마스킹은 admin 스트리밍/export 소비 시점에 적용). 비프 경로면 "audio".
-PII_INTERVAL_MASK_TYPE = "text_only"
+# 2026-06-05(대표 승인): PII_AUDIO_MASK_ENABLED ON 시 worker 가 mask_audio_pii 도 요청해
+# 저장 발화 WAV 에 1kHz 비프를 입힌다(Gate-1 fail-safe — 음성 PII 제거). 따라서 persist 되는
+# pii_intervals 의 maskType 은 "audio"(텍스트+음성 동시 마스킹). 게이트 OFF 면 "text_only" 로 둔다.
+from app import config as _mask_cfg
+PII_INTERVAL_MASK_TYPE = "audio" if _mask_cfg.PII_AUDIO_MASK_ENABLED else "text_only"
 
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "2"))
 VOICE_API_URL = os.getenv("VOICE_API_URL", "http://localhost:8001")

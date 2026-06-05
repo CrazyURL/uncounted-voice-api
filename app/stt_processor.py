@@ -833,7 +833,8 @@ def _transcribe_chunked(
                 )
                 if chunk_pii_ranges:
                     if mask_audio_pii:
-                        beep_ranges = [r for r in chunk_pii_ranges if r[2] in CORE_PII_LABELS]
+                        # 정책(2026-06-05, 대표 승인): 전체 PII 비프(CORE+이름). 텍스트·음성 동기화.
+                        beep_ranges = list(chunk_pii_ranges)
                         if beep_ranges:
                             chunk_audio = mask_audio_ranges(chunk_audio, beep_ranges, config.SAMPLE_RATE)
                     # 글로벌 타임라인으로 변환하여 저장 (beep 여부와 무관하게 range 기록)
@@ -1040,11 +1041,13 @@ def transcribe(
                     pad_sec=config.PII_MASK_PAD_SEC,
                 )
                 if pii_audio_ranges and mask_audio_pii:
-                    # 비프는 고정밀 PII(CORE)만 — 이름·extended numeric 제외(오디오 변형 비가역).
-                    beep_ranges = [r for r in pii_audio_ranges if r[2] in CORE_PII_LABELS]
+                    # 정책(2026-06-05, 대표 승인): 음성도 텍스트와 동일하게 전체 PII 비프.
+                    # CORE(전화/주민/카드 등) + 이름 모두 마스킹 — 텍스트·음성 동기화(Zero-PII 오디오).
+                    # 트레이드오프: 이름 탐지 FP 시 실음성 과다비프 위험 감수(대표 승인).
+                    beep_ranges = list(pii_audio_ranges)
                     if beep_ranges:
                         audio = mask_audio_ranges(audio, beep_ranges, config.SAMPLE_RATE)
-                        logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간, CORE)", task_id, len(beep_ranges))
+                        logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간, 전체PII)", task_id, len(beep_ranges))
 
         # STAGE 15: PII 마스킹 전 화자별 텍스트 스냅샷 (호칭어 기반 관계 탐지용)
         # mask_segments()가 segments 텍스트를 in-place 치환하므로 그 전에 수집해야 한다.
