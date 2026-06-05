@@ -24,10 +24,10 @@ class TestFiller:
 
 class TestHonorific:
     def test_formal(self):
-        assert honorific_level("안녕하세요. 반갑습니다.") == "formal"
+        assert honorific_level("안녕하세요. 반갑습니다.") == "honorific"
 
     def test_informal(self):
-        assert honorific_level("내일 보자. 같이 먹자.") == "informal"
+        assert honorific_level("내일 보자. 같이 먹자.") == "casual"
 
     def test_mixed(self):
         assert honorific_level("안녕하세요. 같이 가자.") == "mixed"
@@ -48,15 +48,17 @@ class TestQuestion:
 
 
 class TestLanguageMix:
-    def test_latin(self):
-        assert language_mix_flag("DLP 팝업창 떴어요") is True
-        assert language_mix_flag("팝업창 떴어요") is False
+    def test_values(self):
+        assert language_mix_flag("DLP 팝업창 떴어요") == "mixed"      # 한글+라틴
+        assert language_mix_flag("팝업창 떴어요") == "korean"          # 한글만
+        assert language_mix_flag("DLP EPP NAC") == "english"          # 라틴만
+        assert language_mix_flag("") is None
 
 
 class TestAudioQualityClass:
     def test_map(self):
-        assert audio_quality_class("A") == "high"
-        assert audio_quality_class("C") == "low"
+        assert audio_quality_class("A") == "excellent"
+        assert audio_quality_class("C") == "fair"
         assert audio_quality_class(None) is None
 
 
@@ -67,7 +69,7 @@ class TestBuilder:
         prev = {"end_sec": 11.5}
         out = build_utterance_stat_labels(utt, prev)
         assert out["question_type"] == "wh"
-        assert out["audio_quality_class"] == "high"
+        assert out["audio_quality_class"] == "excellent"
         assert out["silence_before_sec"] == 0.5
         assert "label_source" not in out  # 라벨흐름 소유 — stat 에서 미설정
 

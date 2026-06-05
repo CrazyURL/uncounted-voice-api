@@ -45,7 +45,7 @@ def filler_word_count(text):
 
 
 def honorific_level(text):
-    """문장 종결 기준 존댓말/반말. 'formal'|'informal'|'mixed'|None."""
+    """문장 종결 기준 존댓말/반말. DB CHECK 허용값 'honorific'|'casual'|'mixed'|None."""
     toks = _tokens(text)
     if not toks:
         return None
@@ -66,9 +66,9 @@ def honorific_level(text):
     if formal and informal:
         return "mixed"
     if formal:
-        return "formal"
+        return "honorific"
     if informal:
-        return "informal"
+        return "casual"
     return None
 
 
@@ -84,14 +84,28 @@ def question_type(text):
     return "yes_no"
 
 
+_HANGUL_CH = re.compile(r"[가-힣]")
+
+
 def language_mix_flag(text):
-    """라틴 2자+ 혼용 여부(외국어/영문 용어)."""
-    return bool(_LATIN.search(text or ""))
+    """언어 구성. DB CHECK 허용값 'korean'|'english'|'mixed'|None.
+
+    한글+라틴(2자+) 공존=mixed, 라틴만=english, 한글만=korean, 내용없음=None.
+    """
+    if not _CONTENT.search(text or ""):
+        return None
+    has_latin = bool(_LATIN.search(text or ""))
+    has_kor = bool(_HANGUL_CH.search(text or ""))
+    if has_latin and has_kor:
+        return "mixed"
+    if has_latin:
+        return "english"
+    return "korean"
 
 
 def audio_quality_class(quality_grade):
-    """quality_grade(A/B/C) → high/medium/low."""
-    return {"A": "high", "B": "medium", "C": "low"}.get(quality_grade)
+    """quality_grade(A/B/C) → DB CHECK 허용값 excellent/good/fair."""
+    return {"A": "excellent", "B": "good", "C": "fair"}.get(quality_grade)
 
 
 def build_utterance_stat_labels(utt, prev_utt=None):
