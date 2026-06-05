@@ -47,6 +47,19 @@ def load(sp):
         wav = torchaudio.functional.resample(wav, sr, 16000)
     return wav
 
+
+def seg_snr(wav, sr=16000, frame_ms=20):
+    """로드맵 #3: true noise SNR(세그먼탈) — 활성음성 vs 하위10% 잡음바닥. crest factor 아님."""
+    a = wav.squeeze(0).numpy().astype(np.float64)
+    n = int(sr * frame_ms / 1000)
+    if len(a) < n * 5: return None
+    pw = np.array([float(np.mean(a[i:i+n] ** 2)) for i in range(0, len(a) - n, n)])
+    pw = pw[pw > 0]
+    if len(pw) < 5: return None
+    noise = np.percentile(pw, 10); speech = np.mean(pw[pw >= np.percentile(pw, 60)])
+    if noise <= 0 or speech <= 0: return None
+    return 10 * np.log10(speech / noise)
+
 # NMR(고정 클린참조) = 첫 발화 중 충분히 긴 것
 ref_rows = GET("utterances?select=storage_path&storage_path=not.is.null&quality_grade=eq.A&limit=5")
 NMR = None
@@ -70,9 +83,12 @@ while True:
                 mos = float(sub(w, NMR if NMR is not None else w)[0])
                 _, pesq, _ = obj(w)
                 pesq = float(pesq[0])
+            tsnr = seg_snr(w)
             vals.append(mos)
             if args.apply:
-                PATCH(f"utterances?id=eq.{u['id']}", {"mos_score": round(mos, 3), "mos_pesq": round(pesq, 3), "mos_method": "squim_v1"})
+                body = {"mos_score": round(mos, 3), "mos_pesq": round(pesq, 3), "mos_method": "squim_v1"}
+                if tsnr is not None: body["true_snr_db"] = round(tsnr, 2)
+                PATCH(f"utterances?id=eq.{u['id']}", body)
             done += 1
         except Exception:
             pass

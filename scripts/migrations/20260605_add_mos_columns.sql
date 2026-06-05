@@ -15,7 +15,9 @@
 ALTER TABLE utterances
     ADD COLUMN IF NOT EXISTS mos_score  double precision,
     ADD COLUMN IF NOT EXISTS mos_pesq   double precision,
-    ADD COLUMN IF NOT EXISTS mos_method text;
+    ADD COLUMN IF NOT EXISTS mos_method text,
+    -- 로드맵 #3: true noise SNR(세그먼탈). 기존 snr_db=crest factor(동적범위)와 별개 지표.
+    ADD COLUMN IF NOT EXISTS true_snr_db double precision;
 
 COMMENT ON COLUMN utterances.mos_score IS
     'non-intrusive MOS 추정(torchaudio SQUIM subjective, 1-5). POLQA/PESQ intrusive 대체. 로드맵 #2.';
