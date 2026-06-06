@@ -14,8 +14,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_COSINE_THRESHOLD = float(os.environ.get("TOPIC_COSINE_THRESHOLD", "0.35"))
+_COSINE_THRESHOLD = float(os.environ.get("TOPIC_COSINE_THRESHOLD", "0.35"))  # (구) 절대 임계 — depth 경로에선 미사용
 _MIN_UTTERANCES_PER_SEGMENT = int(os.environ.get("TOPIC_MIN_UTTERANCES", "3"))
+# TextTiling 상대낙폭(depth) 경계탐지 파라미터 (그리드스캔으로 튜닝)
+_DEPTH_THRESHOLD_DELTA = float(os.environ.get("TOPIC_DEPTH_DELTA", "0.06"))  # 그리드스캔 최적(F1 0.17→0.36)
+_DEPTH_WINDOW = int(os.environ.get("TOPIC_DEPTH_WINDOW", "5"))   # 전후 평균 윈도우 k (스캔 최적)
+_SPEAKER_TURN_AMPLIFY = 1.5   # 화자 교대점 depth 증폭(양방향 보강)
 
 # ── 고정 30개 주제 분류 (seed 문구 기반) ─────────────────────────────────────
 TOPIC_SEED_PHRASES: dict[str, list[str]] = {
@@ -61,6 +65,8 @@ class TopicSegmentResult:
     start_ms: int
     end_ms: int
     utterance_indices: list[int] = field(default_factory=list)
+    topic_confidence: float = 0.0          # 학습모델 분류 신뢰도 (키워드 fallback이면 0.0)
+    topic_method: str = "keyword"          # "model"(학습 분류기) | "keyword"(fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +94,11 @@ def _classify_topic_by_keywords(texts: list[str]) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _get_kcelectra_embeddings(texts: list[str]):
-    """auto_label_service의 인코더로 [CLS] 임베딩을 추출한다.
+    """auto_label_service(감정) 인코더로 [CLS] 임베딩을 추출한다. 실패 시 None.
 
-    실패 시 None 반환.
+    ※ topic 전용 인코더로 교체 실험했으나 경계 F1 개선 없음(0.357≈0.359, 화자보강
+      약화)이라 감정 인코더 유지(2026-06-07 그리드스캔 검증). depth_delta=0.06/win=5는
+      이 감정 인코더 기준 최적값.
     """
     try:
         from app.services.auto_label_service import auto_label_service
@@ -108,23 +116,63 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+# 같은 화자 연속 발화 중간의 경계는 문턱을 이 배수로 높여 거짓컷 억제(화자 교대 보강 A).
+_SAME_SPEAKER_THRESHOLD_FACTOR = 1.5
+
+
+def _calculate_depth_scores(sims: list[float], window: int) -> list[float]:
+    """TextTiling 상대낙폭: 각 gap의 (좌윈도우평균-sim)+(우윈도우평균-sim). 음수는 0.
+
+    절대 임계가 아닌 *주변 대비 국소 곡곡점(valley)* 을 잡아 과소분할 탈출.
+    """
+    n = len(sims)
+    depths: list[float] = []
+    for i in range(n):
+        lo = sims[max(0, i - window):i]
+        hi = sims[i + 1:i + 1 + window]
+        mu_l = (sum(lo) / len(lo)) if lo else sims[i]
+        mu_r = (sum(hi) / len(hi)) if hi else sims[i]
+        depths.append(max(0.0, (mu_l - sims[i]) + (mu_r - sims[i])))
+    return depths
+
+
 def _detect_boundaries(
     embeddings: np.ndarray,
-    threshold: float,
+    threshold: float,                 # (구) 절대임계 — 호환 위해 시그니처 유지, depth 경로 미사용
     min_per_segment: int,
+    speaker_ids: list | None = None,
+    depth_delta: float | None = None,
+    window: int | None = None,
 ) -> list[int]:
-    """cosine 유사도 급변점(경계) 인덱스 목록을 반환한다.
+    """TextTiling 상대낙폭(depth) + 양방향 화자보강 경계 탐지.
 
-    두 인접 임베딩의 cosine similarity가 (1 - threshold) 이하이면 경계.
+    - sims[g] = cos(emb[g], emb[g+1]) (gap g, 경계 후보 인덱스 = g+1)
+    - depth(g) = (좌평균 - sims[g]) + (우평균 - sims[g]) — 국소 곡곡점
+    - 화자보강(양방향): 경계후보가 화자 교대점이면 depth ×1.5 증폭, 같은 화자
+      연속이면 ÷1.5 억제. speaker_ids=None 이면 텍스트만.
+    - depth >= depth_delta 이고 min_per_segment 간격이면 경계 확정.
     """
-    boundaries: list[int] = []
+    depth_delta = _DEPTH_THRESHOLD_DELTA if depth_delta is None else depth_delta
+    window = _DEPTH_WINDOW if window is None else window
     n = len(embeddings)
+    if n < 2:
+        return []
+    sims = [_cosine_sim(embeddings[i], embeddings[i + 1]) for i in range(n - 1)]
+    depths = _calculate_depth_scores(sims, window)
+
+    boundaries: list[int] = []
     since_last = 0
-    for i in range(1, n):
-        sim = _cosine_sim(embeddings[i - 1], embeddings[i])
+    for g in range(n - 1):
+        bidx = g + 1
         since_last += 1
-        if (1.0 - sim) >= threshold and since_last >= min_per_segment:
-            boundaries.append(i)
+        d = depths[g]
+        if speaker_ids is not None and bidx < len(speaker_ids):
+            if speaker_ids[bidx] is not None and speaker_ids[bidx] == speaker_ids[bidx - 1]:
+                d /= _SAME_SPEAKER_THRESHOLD_FACTOR        # 같은 화자 연속 → 억제
+            elif speaker_ids[bidx] != speaker_ids[bidx - 1]:
+                d *= _SPEAKER_TURN_AMPLIFY                  # 화자 교대 → 증폭
+        if d >= depth_delta and since_last >= min_per_segment:
+            boundaries.append(bidx)
             since_last = 0
     return boundaries
 
@@ -151,6 +199,10 @@ def segment_topics(
         return []
 
     texts = [u.get("transcript_text", "") for u in utterances]
+    # 화자 교대 보강(A) — speaker_id(없으면 speaker) 추출. 둘 다 없으면 None → 기존 동작.
+    speaker_ids = [u.get("speaker_id") or u.get("speaker") for u in utterances]
+    if not any(s is not None for s in speaker_ids):
+        speaker_ids = None
 
     # KcELECTRA 임베딩 기반 경계 탐지 시도
     boundaries: list[int] = []
@@ -161,6 +213,7 @@ def segment_topics(
                 embeddings,
                 threshold=_COSINE_THRESHOLD,
                 min_per_segment=_MIN_UTTERANCES_PER_SEGMENT,
+                speaker_ids=speaker_ids,
             )
             logger.info("[topic_seg] 임베딩 기반 경계 %d개 탐지", len(boundaries))
         except Exception as exc:
@@ -171,12 +224,30 @@ def segment_topics(
     split_points = [0] + boundaries + [len(utterances)]
     results: list[TopicSegmentResult] = []
 
-    for seg_idx, (start_i, end_i) in enumerate(
-        zip(split_points[:-1], split_points[1:])
-    ):
+    # 세그먼트별 텍스트 묶음 — 학습 분류기(세그먼트 단위 0.79)로 일괄 분류, 없으면 키워드 fallback
+    seg_text_blobs: list[str] = []
+    seg_ranges: list[tuple[int, int]] = []
+    for start_i, end_i in zip(split_points[:-1], split_points[1:]):
+        seg_utts = utterances[start_i:end_i]
+        seg_text_blobs.append(" ".join(u.get("transcript_text", "") for u in seg_utts))
+        seg_ranges.append((start_i, end_i))
+
+    model_preds: list[tuple[str | None, float]] = []
+    try:
+        from app.services.topic_classifier_service import topic_classifier_service
+        if topic_classifier_service.is_available():
+            model_preds = topic_classifier_service.classify_batch(seg_text_blobs)
+    except Exception as exc:
+        logger.warning("[topic_seg] 학습 분류기 사용 불가 — 키워드 fallback: %s", exc)
+
+    for seg_idx, (start_i, end_i) in enumerate(seg_ranges):
         seg_utts = utterances[start_i:end_i]
         seg_texts = [u.get("transcript_text", "") for u in seg_utts]
-        topic = _classify_topic_by_keywords(seg_texts)
+
+        if seg_idx < len(model_preds) and model_preds[seg_idx][0]:
+            topic, topic_conf, method = model_preds[seg_idx][0], model_preds[seg_idx][1], "model"
+        else:
+            topic, topic_conf, method = _classify_topic_by_keywords(seg_texts), 0.0, "keyword"
 
         start_ms = int(seg_utts[0]["start_sec"] * 1000) if seg_utts else 0
         end_ms = int(seg_utts[-1]["end_sec"] * 1000) if seg_utts else 0
@@ -188,8 +259,10 @@ def segment_topics(
             start_ms=start_ms,
             end_ms=end_ms,
             utterance_indices=utt_indices,
+            topic_confidence=topic_conf,
+            topic_method=method,
         ))
-        logger.debug("[topic_seg] seg[%d] %s (%d발화)", seg_idx, topic, len(seg_utts))
+        logger.debug("[topic_seg] seg[%d] %s (%s, %d발화)", seg_idx, topic, method, len(seg_utts))
 
     logger.info("[topic_seg] 주제 세그먼트 %d개 생성", len(results))
     return results

@@ -1310,6 +1310,8 @@ def transcribe(
                         "start_ms": s.start_ms,
                         "end_ms": s.end_ms,
                         "utterance_indices": s.utterance_indices,
+                        "topic_confidence": s.topic_confidence,
+                        "topic_method": s.topic_method,
                     }
                     for s in topic_segs
                 ]

@@ -759,6 +759,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "start_ms": seg.get("start_ms"),
             "end_ms": seg.get("end_ms"),
             "utterance_count": len(seg.get("utterance_indices", [])),
+            "topic_confidence": seg.get("topic_confidence"),
+            "topic_method": seg.get("topic_method"),
         }
         try:
             # NaN/Inf 가드: 현재 payload 는 int/str 만이나 방어용으로 persist 경계에서 차단.
