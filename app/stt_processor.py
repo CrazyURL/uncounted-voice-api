@@ -1319,6 +1319,20 @@ def transcribe(
             except Exception as topic_err:
                 logger.warning("[%s] 주제 세그먼트 분석 실패 (graceful degradation): %s", task_id, topic_err)
 
+        # 관계 교차검증(inline, forward): 주제 맥락으로 교사 등 저확률 관계 데모션(틀린관계>빈값).
+        # cross-call peer 전파는 별도 backfill(relation_lifecycle_backfill.py)에서 처리.
+        if speakers_result and topic_segments_result:
+            try:
+                from app.services.relation_crossvalidate import crossvalidate_relation
+                _sess_topics = {s.get("topic") for s in topic_segments_result if s.get("topic")}
+                for _sp in speakers_result:
+                    _rel = _sp.get("speaker_relation")
+                    if _rel:
+                        _validated, _ = crossvalidate_relation(_rel, _sess_topics)
+                        _sp["speaker_relation"] = _validated
+            except Exception as _xv_err:
+                logger.warning("[%s] 관계 교차검증 스킵 (graceful): %s", task_id, _xv_err)
+
         # 오디오 통계 계산
         file_size = file_path.stat().st_size if file_path.exists() else 0
         audio_stats = _compute_audio_stats(
