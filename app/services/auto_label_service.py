@@ -10,8 +10,10 @@ AutoLabelService — KcELECTRA 기반 감정/대화행위/말투연령 자동 �
 저장 포맷 (train_emotion_model.py / train_speech_age_model.py 와 일치):
   {version}/encoder/          AutoModel.from_pretrained 로드
   {version}/tokenizer/        AutoTokenizer.from_pretrained 로드
-  감정: heads.pt              {"emotion_head": state_dict, "dialog_act_head": state_dict}
-       label_map.json         {"emotion_labels": [...], "dialog_act_labels": [...]}
+  감정: heads.pt              {"emotion_head": state_dict, "dialog_act_head": state_dict,
+                              "emotion_category_head": state_dict (선택)}
+       label_map.json         {"emotion_labels": [...], "dialog_act_labels": [...],
+                              "emotion_category_labels": [...] (선택)}
   말투: heads.pt              {"speech_age_head": state_dict}
        label_map.json         {"speech_age_labels": [...]}
 """
@@ -32,6 +34,20 @@ FALLBACK_DIALOG_ACT_LABELS = [
     "진술", "질문", "요청", "감사", "인사", "사과",
     "동의", "반대", "확인", "부정", "응답", "제안",
     "명령", "감탄", "기타",
+]
+# 세부감정 6대분류 (헤드 미학습 시 라벨만 fallback; heads.pt에 emotion_category_head
+# 없으면 추론은 None 산출)
+FALLBACK_EMOTION_CATEGORY_LABELS = ["분노", "슬픔", "불안", "상처", "당황", "기쁨"]
+# 주제 20분류 (heads.pt에 topic_head 없으면 추론 None 산출). label_map.json의
+# topic_labels가 정본 — 아래는 헤드 미학습 시 슬롯 유지용 fallback일 뿐.
+FALLBACK_TOPIC_LABELS = [
+    "가족", "건강", "게임", "계절/날씨", "교육", "교통", "군대", "미용",
+    "반려동물", "방송/연예", "사회이슈", "상거래 전반", "스포츠/레저", "식음료",
+    "여행", "연애/결혼", "영화/만화", "주거와 생활", "타 국가 이슈", "회사/아르바이트",
+]
+# 방언 권역 (heads.pt에 dialect_head 없으면 추론 None 산출)
+FALLBACK_DIALECT_LABELS = [
+    "수도권", "강원", "충청", "전라", "경북", "경남", "제주",
 ]
 SPEECH_AGE_LABELS = ["20대", "30대", "40대", "50대+"]
 
@@ -54,6 +70,12 @@ class LabelResult:
     dialog_act: Optional[str]             # 15종
     dialog_act_confidence: float
     model_version: str                    # v{YYYYMMDD_HHMMSS}
+    emotion_category: Optional[str] = None        # 세부감정 6대분류 (헤드 없으면 None)
+    emotion_category_confidence: float = 0.0      # 0.0–1.0
+    topic_category: Optional[str] = None          # 주제 20분류 (헤드 없으면 None)
+    topic_category_confidence: float = 0.0        # 0.0–1.0
+    dialect: Optional[str] = None                 # 방언 권역 (헤드 없으면 None)
+    dialect_confidence: float = 0.0               # 0.0–1.0
 
 
 @dataclass
@@ -93,8 +115,14 @@ class AutoLabelService:
         self._encoder = None
         self._emotion_head = None
         self._dialog_act_head = None
+        self._emotion_category_head = None
+        self._topic_head = None
+        self._dialect_head = None
         self._emotion_labels: list[str] = FALLBACK_EMOTION_LABELS
         self._dialog_act_labels: list[str] = FALLBACK_DIALOG_ACT_LABELS
+        self._emotion_category_labels: list[str] = FALLBACK_EMOTION_CATEGORY_LABELS
+        self._topic_labels: list[str] = FALLBACK_TOPIC_LABELS
+        self._dialect_labels: list[str] = FALLBACK_DIALECT_LABELS
         self._model_version: str = ""
         self._load_attempted = False
 
@@ -151,6 +179,24 @@ class AutoLabelService:
                     else:
                         d_conf, d_idx = None, None
 
+                    if self._emotion_category_head is not None:
+                        ec_probs = torch.softmax(self._emotion_category_head(cls), dim=-1)
+                        ec_conf, ec_idx = ec_probs.max(dim=-1)
+                    else:
+                        ec_conf, ec_idx = None, None
+
+                    if self._topic_head is not None:
+                        tp_probs = torch.softmax(self._topic_head(cls), dim=-1)
+                        tp_conf, tp_idx = tp_probs.max(dim=-1)
+                    else:
+                        tp_conf, tp_idx = None, None
+
+                    if self._dialect_head is not None:
+                        dl_probs = torch.softmax(self._dialect_head(cls), dim=-1)
+                        dl_conf, dl_idx = dl_probs.max(dim=-1)
+                    else:
+                        dl_conf, dl_idx = None, None
+
                 for j in range(len(batch)):
                     results.append(LabelResult(
                         emotion=self._emotion_labels[e_idx[j].item()],
@@ -163,6 +209,27 @@ class AutoLabelService:
                             round(d_conf[j].item(), 4) if d_conf is not None else 0.0
                         ),
                         model_version=self._model_version,
+                        emotion_category=(
+                            self._emotion_category_labels[ec_idx[j].item()]
+                            if ec_idx is not None else None
+                        ),
+                        emotion_category_confidence=(
+                            round(ec_conf[j].item(), 4) if ec_conf is not None else 0.0
+                        ),
+                        topic_category=(
+                            self._topic_labels[tp_idx[j].item()]
+                            if tp_idx is not None else None
+                        ),
+                        topic_category_confidence=(
+                            round(tp_conf[j].item(), 4) if tp_conf is not None else 0.0
+                        ),
+                        dialect=(
+                            self._dialect_labels[dl_idx[j].item()]
+                            if dl_idx is not None else None
+                        ),
+                        dialect_confidence=(
+                            round(dl_conf[j].item(), 4) if dl_conf is not None else 0.0
+                        ),
                     ))
 
             except Exception as exc:
@@ -285,10 +352,18 @@ class AutoLabelService:
                 lm = json.loads(label_map_path.read_text(encoding="utf-8"))
                 self._emotion_labels = lm.get("emotion_labels", FALLBACK_EMOTION_LABELS)
                 self._dialog_act_labels = lm.get("dialog_act_labels", FALLBACK_DIALOG_ACT_LABELS)
+                self._emotion_category_labels = lm.get(
+                    "emotion_category_labels", FALLBACK_EMOTION_CATEGORY_LABELS
+                )
+                self._topic_labels = lm.get("topic_labels", FALLBACK_TOPIC_LABELS)
+                self._dialect_labels = lm.get("dialect_labels", FALLBACK_DIALECT_LABELS)
 
             hidden = self._encoder.config.hidden_size
             self._emotion_head = nn.Linear(hidden, len(self._emotion_labels))
             self._dialog_act_head = nn.Linear(hidden, len(self._dialog_act_labels))
+            self._emotion_category_head = nn.Linear(hidden, len(self._emotion_category_labels))
+            self._topic_head = nn.Linear(hidden, len(self._topic_labels))
+            self._dialect_head = nn.Linear(hidden, len(self._dialect_labels))
 
             if heads_path.exists():
                 heads = torch.load(str(heads_path), map_location="cpu")
@@ -299,12 +374,50 @@ class AutoLabelService:
                 else:
                     self._dialog_act_head = None
                     logger.info("AutoLabelService: emotion-only 모델 — dialog_act_head 없음")
+                # 세부감정 헤드 — heads.pt에 있을 때만 로드, 없으면 None (추론 시 None 산출)
+                if "emotion_category_head" in heads:
+                    self._emotion_category_head.load_state_dict(heads["emotion_category_head"])
+                    logger.info(
+                        "AutoLabelService: emotion_category_head 로드 완료 (세부감정 %d종)",
+                        len(self._emotion_category_labels),
+                    )
+                else:
+                    self._emotion_category_head = None
+                    logger.info(
+                        "AutoLabelService: emotion_category_head 없음 — 세부감정 None 산출"
+                    )
+                # 주제 20분류 헤드 — heads.pt에 있을 때만 로드, 없으면 None
+                if "topic_head" in heads:
+                    self._topic_head.load_state_dict(heads["topic_head"])
+                    logger.info(
+                        "AutoLabelService: topic_head 로드 완료 (주제 %d종)",
+                        len(self._topic_labels),
+                    )
+                else:
+                    self._topic_head = None
+                    logger.info("AutoLabelService: topic_head 없음 — 주제 None 산출")
+                # 방언 권역 헤드 — heads.pt에 있을 때만 로드, 없으면 None
+                if "dialect_head" in heads:
+                    self._dialect_head.load_state_dict(heads["dialect_head"])
+                    logger.info(
+                        "AutoLabelService: dialect_head 로드 완료 (방언 %d권역)",
+                        len(self._dialect_labels),
+                    )
+                else:
+                    self._dialect_head = None
+                    logger.info("AutoLabelService: dialect_head 없음 — 방언 None 산출")
             else:
                 logger.warning("AutoLabelService: heads.pt 없음 — 랜덤 가중치로 초기화")
 
             self._emotion_head.eval()
             if self._dialog_act_head is not None:
                 self._dialog_act_head.eval()
+            if self._emotion_category_head is not None:
+                self._emotion_category_head.eval()
+            if self._topic_head is not None:
+                self._topic_head.eval()
+            if self._dialect_head is not None:
+                self._dialect_head.eval()
             self._model_version = model_path.name
             logger.info("AutoLabelService: 로드 완료 — %s", self._model_version)
 
@@ -314,6 +427,9 @@ class AutoLabelService:
             self._tokenizer = None
             self._emotion_head = None
             self._dialog_act_head = None
+            self._emotion_category_head = None
+            self._topic_head = None
+            self._dialect_head = None
 
 
     def _try_load_speech_age(self) -> None:
@@ -374,6 +490,12 @@ def _null_result(version: str = "") -> LabelResult:
         dialog_act=None,
         dialog_act_confidence=0.0,
         model_version=version,
+        emotion_category=None,
+        emotion_category_confidence=0.0,
+        topic_category=None,
+        topic_category_confidence=0.0,
+        dialect=None,
+        dialect_confidence=0.0,
     )
 
 

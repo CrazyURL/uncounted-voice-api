@@ -680,6 +680,12 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "emotion_confidence": utt.get("emotion_confidence"),
             "dialog_act": utt.get("dialog_act"),
             "dialog_act_confidence": utt.get("dialog_act_confidence"),
+            "emotion_category": utt.get("emotion_category"),
+            "emotion_category_confidence": utt.get("emotion_category_confidence"),
+            "topic_category": utt.get("topic_category"),
+            "topic_category_confidence": utt.get("topic_category_confidence"),
+            "dialect": utt.get("dialect"),
+            "dialect_confidence": utt.get("dialect_confidence"),
             "auto_label_model_version": utt.get("auto_label_model_version"),
             "label_source": utt.get("label_source"),
             # Stage 15 Tier A: 통계 라벨

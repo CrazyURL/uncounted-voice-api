@@ -1282,6 +1282,15 @@ def transcribe(
                 u["dialog_act"] = lbl.dialog_act
                 u["dialog_act_confidence"] = lbl.dialog_act_confidence
                 u["auto_label_model_version"] = lbl.model_version
+                # 세부감정 — 헤드 미학습 시 None (무해 null write)
+                u["emotion_category"] = lbl.emotion_category
+                u["emotion_category_confidence"] = lbl.emotion_category_confidence
+                # 주제 20분류 — 헤드 미학습 시 None (무해 null write)
+                u["topic_category"] = lbl.topic_category
+                u["topic_category_confidence"] = lbl.topic_category_confidence
+                # 방언 권역 — 헤드 미학습 시 None (무해 null write)
+                u["dialect"] = lbl.dialect
+                u["dialect_confidence"] = lbl.dialect_confidence
 
         # Task 5: 화자중첩(overlap) 메타 부착 (env-gated, 무중단) — 메인 diarization
         # 결과(diarize_segments) 재사용, 추가 GPU 추론 0회.
