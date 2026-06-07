@@ -1292,6 +1292,24 @@ def transcribe(
                 u["dialect"] = lbl.dialect
                 u["dialect_confidence"] = lbl.dialect_confidence
 
+        # 세부감정(SER) — 오디오가 정답(실측 텍스트 0.34 < 오디오 0.51). 발화 오디오 슬라이스
+        # → 7분류 예측으로 emotion_category 오버라이드(텍스트 헤드는 None 산출). graceful.
+        if utterances_result and audio is not None:
+            try:
+                from app.services.ser_emotion_service import ser_emotion_service
+                if ser_emotion_service.is_available():
+                    _ser_sr = config.SAMPLE_RATE
+                    _ser_clips = [
+                        audio[int(u.get("start_sec", 0) * _ser_sr): int(u.get("end_sec", 0) * _ser_sr)]
+                        for u in utterances_result
+                    ]
+                    for u, (emo, conf) in zip(utterances_result, ser_emotion_service.predict(_ser_clips)):
+                        if emo is not None:
+                            u["emotion_category"] = emo
+                            u["emotion_category_confidence"] = conf
+            except Exception as _ser_err:
+                logger.warning("[%s] SER 오디오 감정 스킵 (graceful): %s", task_id, _ser_err)
+
         # Task 5: 화자중첩(overlap) 메타 부착 (env-gated, 무중단) — 메인 diarization
         # 결과(diarize_segments) 재사용, 추가 GPU 추론 0회.
         _maybe_attach_overlap(diarize_segments, utterances_result, task_id)
