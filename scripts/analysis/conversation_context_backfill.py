@@ -29,6 +29,7 @@
 import argparse
 import json
 import os
+import re
 import urllib.request
 
 # ── 상수 ────────────────────────────────────────────────────────────────
@@ -115,9 +116,12 @@ def _prev_turn_gist(idx: int, rows: list[dict], pii_scan) -> str:
         txt = (prev.get("transcript_text") or "").strip()
         if not txt:
             return DEFAULT
-        if pii_scan(txt):           # 잔존 PII → 드롭
+        if pii_scan(txt):           # 잔존 PII(전화/주민/카드 등 고정밀 패턴) → 드롭
             return DEFAULT
         gist = txt[:PREV_GIST_MAX_CHARS]
+        # transcript_text 는 numeric_sensitive_like(6+ Arabic 숫자: 생년월일/계좌 등)를 char-마스킹하지 않으므로
+        # gist 에 그대로 실리면 export safety preflight 에 걸린다(누출). 잔존 6+ 숫자열을 추가 마스킹한다.
+        gist = re.sub(r"(?<![\dA-Za-z._-])\d{6,}(?![\dA-Za-z._-])", "[PII_numeric_sensitive_like]", gist)
         return gist if gist else DEFAULT
     return DEFAULT
 
