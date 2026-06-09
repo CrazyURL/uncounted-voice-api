@@ -59,6 +59,11 @@ PII_INTERVAL_MASK_TYPE = "audio" if _mask_cfg.PII_AUDIO_MASK_ENABLED else "text_
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "2"))
 VOICE_API_URL = os.getenv("VOICE_API_URL", "http://localhost:8001")
 
+# 세션 처리 직후 라벨 백필 4종(dialog_act/va_emotion/conversation_context/topic_summary)을
+# 인라인 자동 실행. 기본 OFF(안전 롤아웃) — true 일 때만 진입. best-effort(실패해도 세션은 done).
+# va_emotion 은 항상 --cpu 로 호출(voice-api 와 GPU 충돌/OOM 방지).
+WORKER_INLINE_BACKFILL_ENABLED = os.getenv("WORKER_INLINE_BACKFILL_ENABLED", "false") == "true"
+
 # ── Required environment ──────────────────────────────────────────────
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -978,6 +983,42 @@ async def sweep_segment_backfill() -> None:
         log.error("sweep_segment_backfill error: %s", e)
 
 
+# ── Inline label backfill (post-session) ──────────────────────────────
+
+async def _run_inline_backfills(session_id: str) -> None:
+    """세션 처리 직후 라벨 백필 4종을 오케스트레이터로 인라인 실행.
+
+    best-effort: 모든 예외를 삼킨다(백필 실패가 세션을 실패시키지 않음 — 세션은 이미 done).
+    호출 가드(게이트/발화수)는 호출부에서 수행.
+    """
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    python_bin = os.path.join(repo_root, "venv", "bin", "python3")
+    script = os.path.join("scripts", "analysis", "run_session_backfills.py")
+    cmd = [
+        python_bin, script,
+        "--session", session_id,
+        "--apply",
+        "--cpu",  # va_emotion 은 항상 CPU (voice-api GPU 충돌/OOM 방지)
+    ]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "."
+    try:
+        log.info("[%s] inline backfill start", session_id)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=repo_root,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        tail = (stdout.decode("utf-8", "replace") if stdout else "").strip().splitlines()
+        note = tail[-1] if tail else ""
+        log.info("[%s] inline backfill done (exit=%s) %s", session_id, proc.returncode, note)
+    except Exception as e:  # noqa: BLE001 — best-effort, 세션은 이미 done
+        log.warning("[%s] inline backfill failed (non-fatal): %s", session_id, e)
+
+
 # ── Session processing ────────────────────────────────────────────────
 
 async def process_one_session() -> str:
@@ -1056,6 +1097,12 @@ async def process_one_session() -> str:
             }).eq("id", session_id).execute()
         )
         log.info("[%s] done (%d utterances)", session_id, utterance_count)
+
+        # 세션 처리 직후 라벨 백필 4종 인라인 자동 실행(게이트 ON + 발화>0).
+        # best-effort: 실패해도 세션은 이미 done(여기서 예외는 _run_inline_backfills 가 삼킴).
+        if WORKER_INLINE_BACKFILL_ENABLED and utterance_count > 0:
+            await _run_inline_backfills(session_id)
+
         return "done"
 
     except Voice503Error as e:
