@@ -214,9 +214,10 @@ async def submit_to_voice_api(audio_path: str) -> str:
         form = aiohttp.FormData()
         form.add_field("file", f, filename=f"raw.{ext}", content_type="application/octet-stream")
         async with _http.post(url, params=params, data=form) as resp:
-            if resp.status == 503:
+            if resp.status >= 500:
+                # 5xx(503 포함) = voice-api 일시장애(OOM 등). retry 소진 방지 위해 Voice503Error 처리.
                 text = await resp.text()
-                raise Voice503Error(f"voice_api 503: {text[:500]}")
+                raise Voice503Error(f"voice_api {resp.status}: {text[:500]}")
             resp.raise_for_status()
             body = await resp.json()
             return body["task_id"]
@@ -231,7 +232,8 @@ async def poll_job(task_id: str) -> dict:
     while True:
         async with _http.get(url) as resp:
             if resp.status >= 500:
-                raise Exception(f"poll_job {task_id}: HTTP {resp.status}")
+                # voice-api 5xx = 일시장애(OOM 등) → retry 미증가(Voice503Error).
+                raise Voice503Error(f"poll_job {task_id}: HTTP {resp.status}")
             resp.raise_for_status()
             body = await resp.json()
 
@@ -239,7 +241,11 @@ async def poll_job(task_id: str) -> dict:
         if status == "completed":
             return body
         if status == "failed":
-            raise Exception(f"voice_api job failed: {body.get('error', '')[:500]}")
+            err = body.get("error", "") or ""
+            # OOM/CUDA 처리실패는 일시적(GPU 혼잡) → retry 미증가. 그 외 진짜 결함은 retry 증가.
+            if "out of memory" in err.lower() or "cuda" in err.lower():
+                raise Voice503Error(f"voice_api job OOM: {err[:500]}")
+            raise Exception(f"voice_api job failed: {err[:500]}")
 
         if loop.time() >= deadline:
             raise Exception(f"poll_job timeout {VOICE_API_MAX_WAIT_SEC}s: {task_id}")
