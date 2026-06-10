@@ -1118,6 +1118,22 @@ async def process_one_session() -> str:
         )
         return "503"
 
+    except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError,
+            aiohttp.ClientOSError, aiohttp.ClientConnectionError) as e:
+        # voice-api 다운(크래시/재시작 중) = 인프라 장애지 세션 결함이 아니다.
+        # retry_count 증가 금지(다운타임에 retry 소진→영구실패 캐스케이드 방지),
+        # pending 으로 되돌리고 503 백오프 재사용. keepalive 가 voice-api 복구하면 재개.
+        log.warning("[%s] voice-api 연결 실패(다운 추정) — pending 복귀, retry 미증가: %s", session_id, e)
+        await _run(
+            lambda: _supabase.table("sessions").update({
+                "gpu_upload_status": "pending",
+                "gpu_started_at": None,
+                "gpu_last_error": ("VOICE_API_DOWN: " + str(e))[:2000],
+                "updated_at": _now_iso(),
+            }).eq("id", session_id).execute()
+        )
+        return "503"
+
     except Exception as e:
         log.error("[%s] processing failed: %s", session_id, e, exc_info=True)
         await increment_retry(session_id, str(e)[:2000])
