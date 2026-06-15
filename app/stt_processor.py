@@ -993,7 +993,20 @@ def transcribe(
                         # ★동적 스위칭(2026-06-03 확정·06-05 실측): 통화 길이로 화자분리 보정
                         # 엔진 라우팅. ≤VOICE_DIAR_THRESHOLD_SEC → NeMo 전체재분리(도입부 정확),
                         # 초과 → anchor(OOM 방어). 게이트 OFF/실패 시 무변경(무중단).
-                        result = _maybe_apply_dynamic_diar(audio, config.SAMPLE_RATE, result, file_path, task_id)
+                        #
+                        # NeMo 마이크로서비스(soundfile)는 m4a(AAC) 를 못 열어 LibsndfileError →
+                        # pyannote fallback(한국어 화자분리 품질 저하). 이미 16kHz mono 로 디코드된
+                        # audio 를 wav 로 써서 그 경로를 넘긴다(/dev/shm RAM disk, ffmpeg 불요).
+                        # 실패 시 원본 경로 폴백. 정리는 finally 의 임시파일 블록.
+                        nemo_audio_path = config.TEMP_DIR / f"{task_id}_nemo.wav"
+                        try:
+                            nemo_audio_path.write_bytes(to_wav_bytes(audio, config.SAMPLE_RATE))
+                            diar_path = nemo_audio_path
+                        except Exception as wav_err:  # noqa: BLE001 — wav 실패가 STT 를 막지 않도록
+                            logger.warning("[%s] NeMo 입력 wav 생성 실패 — 원본 경로 사용: %s",
+                                           task_id, wav_err)
+                            diar_path = file_path
+                        result = _maybe_apply_dynamic_diar(audio, config.SAMPLE_RATE, result, diar_path, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
@@ -1414,6 +1427,14 @@ def transcribe(
                 logger.info("[%s] 음성 파일 삭제 완료", task_id)
         except OSError as e:
             logger.warning("[%s] 음성 파일 삭제 실패: %s", task_id, e)
+
+        # NeMo 입력용 임시 wav 정리 (m4a 디코드 우회분)
+        try:
+            nemo_wav = config.TEMP_DIR / f"{task_id}_nemo.wav"
+            if nemo_wav.exists():
+                os.unlink(nemo_wav)
+        except OSError:
+            pass
 
         # 청크 모드 잔여 파일 정리 (OOM/크래시 대비)
         import glob
