@@ -185,6 +185,44 @@ def _compute_audio_stats(
     return stats
 
 
+def _echo_norm(s: str) -> str:
+    """echo 비교용 정규화 — 공백/문장부호 제거."""
+    import re
+    return re.sub(r"[\s.,!?~…'\"·]", "", s or "")
+
+
+_PROMPT_ECHO_NORM_CACHE: dict[str, str] = {}
+
+
+def _is_pure_prompt_echo(text: str) -> bool:
+    """세그먼트 text가 INITIAL_PROMPT의 순수 echo인지 (거의 전부 프롬프트 조각).
+
+    WhisperX가 initial_prompt를 환각 전사하는 누출(약 84발화 확인, 2026-06-17).
+    순수 echo만 제거(coverage>=0.85, 최소중첩 8자) — 실제 발화가 섞인 혼합은 보존(보수적).
+    env-gate(config.PROMPT_ECHO_FILTER_ENABLED) OFF면 무동작(기존 동작 무변경).
+    """
+    if not config.PROMPT_ECHO_FILTER_ENABLED:
+        return False
+    prompt = config.INITIAL_PROMPT
+    if not prompt or not text:
+        return False
+    nt = _echo_norm(text)
+    if len(nt) < 8:
+        return False
+    npr = _PROMPT_ECHO_NORM_CACHE.get(prompt)
+    if npr is None:
+        npr = _echo_norm(prompt)
+        _PROMPT_ECHO_NORM_CACHE[prompt] = npr
+    # 순서무관 n-gram(4) 멤버십 coverage — WhisperX가 프롬프트를 뒤섞어 반복한
+    # echo도 포착(단일정렬은 reorder를 놓침). 혼합(실발화 포함)은 coverage<0.85로 보존.
+    k = 4
+    grams = [nt[i:i + k] for i in range(len(nt) - k + 1)]
+    if not grams:
+        return False
+    in_prompt = sum(1 for g in grams if g in npr)
+    return in_prompt / len(grams) >= 0.85
+
+
 def _clean_segments(raw_segments: list[dict]) -> list[dict]:
     """WhisperX 결과 세그먼트를 정리한다 (word 데이터 보존).
 
@@ -196,11 +234,16 @@ def _clean_segments(raw_segments: list[dict]) -> list[dict]:
     발화 분리/화자 배정에 영향이 없고, transcript_words JSONB 추가 키로만 흐른다.
     """
     segments = []
+    echo_dropped = 0
     for seg in raw_segments:
+        text = seg.get("text", "").strip()
+        if _is_pure_prompt_echo(text):
+            echo_dropped += 1
+            continue
         segment = {
             "start": round(seg.get("start", 0), 2),
             "end": round(seg.get("end", 0), 2),
-            "text": seg.get("text", "").strip(),
+            "text": text,
         }
         if "speaker" in seg:
             segment["speaker"] = seg["speaker"]
@@ -215,6 +258,8 @@ def _clean_segments(raw_segments: list[dict]) -> list[dict]:
                 if w.get("start") is not None and w.get("end") is not None
             ]
         segments.append(segment)
+    if echo_dropped:
+        logger.info("프롬프트 echo 세그먼트 %d개 제거", echo_dropped)
     return segments
 
 
@@ -993,7 +1038,20 @@ def transcribe(
                         # ★동적 스위칭(2026-06-03 확정·06-05 실측): 통화 길이로 화자분리 보정
                         # 엔진 라우팅. ≤VOICE_DIAR_THRESHOLD_SEC → NeMo 전체재분리(도입부 정확),
                         # 초과 → anchor(OOM 방어). 게이트 OFF/실패 시 무변경(무중단).
-                        result = _maybe_apply_dynamic_diar(audio, config.SAMPLE_RATE, result, file_path, task_id)
+                        #
+                        # NeMo 마이크로서비스(soundfile)는 m4a(AAC) 를 못 열어 LibsndfileError →
+                        # pyannote fallback(한국어 화자분리 품질 저하). 이미 16kHz mono 로 디코드된
+                        # audio 를 wav 로 써서 그 경로를 넘긴다(/dev/shm RAM disk, ffmpeg 불요).
+                        # 실패 시 원본 경로 폴백. 정리는 finally 의 임시파일 블록.
+                        nemo_audio_path = config.TEMP_DIR / f"{task_id}_nemo.wav"
+                        try:
+                            nemo_audio_path.write_bytes(to_wav_bytes(audio, config.SAMPLE_RATE))
+                            diar_path = nemo_audio_path
+                        except Exception as wav_err:  # noqa: BLE001 — wav 실패가 STT 를 막지 않도록
+                            logger.warning("[%s] NeMo 입력 wav 생성 실패 — 원본 경로 사용: %s",
+                                           task_id, wav_err)
+                            diar_path = file_path
+                        result = _maybe_apply_dynamic_diar(audio, config.SAMPLE_RATE, result, diar_path, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
@@ -1414,6 +1472,14 @@ def transcribe(
                 logger.info("[%s] 음성 파일 삭제 완료", task_id)
         except OSError as e:
             logger.warning("[%s] 음성 파일 삭제 실패: %s", task_id, e)
+
+        # NeMo 입력용 임시 wav 정리 (m4a 디코드 우회분)
+        try:
+            nemo_wav = config.TEMP_DIR / f"{task_id}_nemo.wav"
+            if nemo_wav.exists():
+                os.unlink(nemo_wav)
+        except OSError:
+            pass
 
         # 청크 모드 잔여 파일 정리 (OOM/크래시 대비)
         import glob

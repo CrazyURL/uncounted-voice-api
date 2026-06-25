@@ -150,6 +150,13 @@ VAD_OFFSET = float(os.environ.get("VAD_OFFSET", "0.100"))
 HOTWORDS = os.environ.get("HOTWORDS", None)
 INITIAL_PROMPT = os.environ.get("INITIAL_PROMPT", None)
 
+# 프롬프트 echo 필터 — WhisperX가 INITIAL_PROMPT를 환각 전사하는 누출 제거
+# (약 84발화 확인, 2026-06-17). 순수 echo 세그먼트(coverage>=0.85)만 드롭, 혼합은 보존.
+# env-gate 기본 OFF → 재처리 트랙에서 VOICE_PROMPT_ECHO_FILTER_ENABLED=true 로 활성.
+PROMPT_ECHO_FILTER_ENABLED = (
+    os.environ.get("VOICE_PROMPT_ECHO_FILTER_ENABLED", "false").lower() == "true"
+)
+
 # 도메인 핫워드 엔진 (B+D) — 기본 OFF, byte-identical.
 # 설계: docs/design_review_panel_redesign_20260603.md §5
 # HOTWORD_ENGINE_ENABLED: D(혼동쌍 후처리 교정) 게이트
