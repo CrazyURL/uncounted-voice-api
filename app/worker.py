@@ -140,6 +140,11 @@ async def pick_next_session() -> Optional[dict]:
         )
         candidates = result.data or []
 
+    # SJF(짧은 통화 우선): oldest-5 FIFO 윈도우 안에서 duration 짧은 것부터 처리.
+    # 처리량↑(짧은 통화가 50분 장통화 뒤에서 안 막힘) + 윈도우=FIFO라 장통화도
+    # 결국 oldest 윈도우에 들어와 처리됨(starvation 완화). null duration=0 취급(먼저).
+    candidates.sort(key=lambda s: (s.get("duration") or 0))
+
     for session in candidates:
         if await _try_claim(session["id"], session["gpu_upload_status"]):
             return session
