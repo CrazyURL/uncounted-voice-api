@@ -135,11 +135,12 @@ HUMAN_SRC = ('ground_truth_consented', 'human', 'human_locked', 'manual_correcti
 
 def main():
     apply = "--apply" in sys.argv
-    peers = get("peers?select=id,relationship,rel_source&order=call_count.desc")
+    peers = get("peers?select=id,relationship,rel_source,override_locked&order=call_count.desc")
     results = []
     for p in peers:
         t = get(f"sessions?select=title&peer_id=eq.{p['id']}&title=not.is.null&limit=1")
         r = score_peer(p['id'], t[0]['title'] if t else None, p.get('relationship'), p.get('rel_source'))
+        r['override_locked'] = p.get('override_locked')
         results.append(r)
     json.dump(results, open("/tmp/peer_attr_scores.json", "w"), ensure_ascii=False, indent=1)
     print("=== 상태 분포 ===", dict(Counter(r['state'] for r in results)))
@@ -153,19 +154,28 @@ def main():
     print(f"=== CONFLICT(human) {sum(1 for r in results if r['state']=='CONFLICT')} · WEAK {sum(1 for r in results if r['state']=='WEAK')} · UNKNOWN {sum(1 for r in results if r['state']=='UNKNOWN')}")
 
     if not apply:
-        print("\n[DRY-RUN] write 없음. --apply 로 안전정책 적용. (gender/age 는 peers 컬럼 신설 후)")
+        print("\n[DRY-RUN] write 없음. --apply 로 087 컬럼 적재.")
         return 0
-    # 안전정책: PEER_STRONG·가족·구체관계만, human-lock 보존, conflict/weak/unknown skip
-    wrote = 0
-    for r in fam:
-        if r['cur_src'] in HUMAN_SRC:
-            print(f"  skip {r['id'][:8]} (human-lock 보존)"); continue
-        if r['relationship'] == r['cur_rel']:
-            continue
-        c = patch(r['id'], {"relationship": r['relationship'], "rel_confidence": r['confidence'], "rel_source": "multilayer_v1"})
+    # 087 컬럼 적재: override_locked=false 만. attr_category/attr_state/gender/gender_source.
+    # relationship(legacy)·voice/speech_age 는 미변경(legacy 보존·age 미산출). 가족 깨끗단일신호만 relationship도 갱신.
+    wrote = 0; skip_lock = 0
+    for r in results:
+        if r.get('override_locked'):
+            skip_lock += 1; continue
+        payload = {"attr_category": r['category'], "attr_state": r['state']}
+        if r['gender'] in ('male', 'female', 'non_binary'):
+            payload['gender'] = r['gender']; payload['gender_source'] = r['gender_source']
+        # 가족 + 깨끗한 단일 호칭신호일 때만 relationship 갱신(legacy 비-human은 덮어도 무방)
+        if r['state'] == 'PEER_STRONG' and r['category'] == '가족' and r['relationship'] and r['cur_src'] not in HUMAN_SRC:
+            payload['relationship'] = r['relationship']; payload['rel_confidence'] = r['confidence']; payload['rel_source'] = 'multilayer_v1'
+        c = patch(r['id'], payload)
         wrote += c in (200, 204)
-        print(f"  write {r['id'][:8]} → {r['relationship']} rc={c}")
-    print(f"\n적용: 가족 구체관계 {wrote}건 (업무/conflict/weak/human-lock 미적용). gender/age=peers컬럼 신설 후 적재.")
+    print(f"\n087 적재: {wrote}건 (override_locked skip {skip_lock}). attr_category/attr_state/gender 채움. relationship(legacy)·age 미변경.")
+    # 검증
+    from collections import Counter as _C
+    chk = get("peers?select=attr_category,attr_state&limit=200")
+    print("적재 후 attr_category:", dict(_C(x.get('attr_category') for x in chk)))
+    print("적재 후 attr_state:", dict(_C(x.get('attr_state') for x in chk)))
     return 0
 
 if __name__ == "__main__":
