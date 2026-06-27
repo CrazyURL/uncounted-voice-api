@@ -1329,6 +1329,37 @@ def transcribe(
             except Exception as spk_err:
                 logger.warning("[%s] 화자 분석 실패 (graceful degradation): %s", task_id, spk_err)
 
+        # 청크 모드 화자행 갭 수정(2026-06-27): audio=None 이라 librosa/embedding 불가 →
+        # segments duration 휴리스틱으로 self/other 역할만 부여해 session_speakers 행 생성.
+        # (없으면 장통화 139세션이 화자행 0 → 발화 self/other 귀속 불가.)
+        # gender/age 는 None — self=프로필(worker self-skip)·peer=자가신고에서 채움.
+        if enable_diarize and diarize_active and use_chunked and segments and speakers_result is None:
+            try:
+                from app.services.speaker_analysis_service import _is_human
+                _dur: dict[str, float] = {}
+                for seg in segments:
+                    lbl = seg.get("speaker")
+                    if lbl:
+                        _dur[lbl] = _dur.get(lbl, 0.0) + (float(seg.get("end", 0)) - float(seg.get("start", 0)))
+                _human = {l: d for l, d in _dur.items() if _is_human(l)}
+                _self = max(_human, key=_human.get) if _human else None
+                speakers_result = [
+                    {
+                        "speaker_label": lbl,
+                        "speaker_role": "self" if lbl == _self else "other",
+                        "speaker_role_source": "chunk_duration_heuristic",
+                        "speaker_gender": None,
+                        "speaker_voice_age_range": None,
+                        "speaker_speech_age_range": None,
+                        "speaker_speech_age_model_version": None,
+                        "speaker_relation": None,
+                    }
+                    for lbl in _dur
+                ]
+                logger.info("[%s] 청크 화자 역할 분석(duration heuristic) %d명", task_id, len(speakers_result))
+            except Exception as spk_err:
+                logger.warning("[%s] 청크 화자 분석 실패: %s", task_id, spk_err)
+
         # 자동 감정/대화행위 라벨링 (모델 없을 때 graceful degradation)
         from app.services.auto_label_service import auto_label_service
         if utterances_result and auto_label_service.is_available():
