@@ -86,6 +86,10 @@ def hwagye_hochik(pid):
         elif jr < 0.4: hw, hw_conf = '가족', round(1 - jr, 2)
     return hw, hw_conf, p2o, o2p
 
+# gender canonical = 앱 정본 한국어(users_profile·peers 089 union CHECK). 영문 파생값을 한국어로 정규화해 emit.
+GEN_EN2KO = {'male': '남성', 'female': '여성', 'non_binary': '논바이너리'}
+
+
 def score_peer(pid, title, cur_rel, cur_src):
     mc = meta_layer(title)
     hw, hw_conf, p2o, o2p = hwagye_hochik(pid)
@@ -125,7 +129,7 @@ def score_peer(pid, title, cur_rel, cur_src):
     else:
         conf = 0.0
     return {
-        "id": pid, "category": cat, "relationship": rel, "gender": gen, "gender_source": gsrc,
+        "id": pid, "category": cat, "relationship": rel, "gender": GEN_EN2KO.get(gen), "gender_source": gsrc,
         "confidence": conf, "state": state, "spec_conflict": spec_conflict,
         "layers": {"meta": mc, "hwagye": hw, "hochik": ho},
         "cur_rel": cur_rel, "cur_src": cur_src,
@@ -163,7 +167,7 @@ def main():
         if r.get('override_locked'):
             skip_lock += 1; continue
         payload = {"attr_category": r['category'], "attr_state": r['state']}
-        if r['gender'] in ('male', 'female', 'non_binary'):
+        if r['gender'] in ('남성', '여성', '논바이너리'):
             payload['gender'] = r['gender']; payload['gender_source'] = r['gender_source']
         # 가족 + 깨끗한 단일 호칭신호일 때만 relationship 갱신(legacy 비-human은 덮어도 무방)
         if r['state'] == 'PEER_STRONG' and r['category'] == '가족' and r['relationship'] and r['cur_src'] not in HUMAN_SRC:
