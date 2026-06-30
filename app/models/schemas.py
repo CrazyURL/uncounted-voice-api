@@ -234,16 +234,14 @@ class SpeakerInfo(BaseModel):
     """STAGE 15: 화자 분석 결과.
 
     WeSpeaker 임베딩 매칭(profile_match) 또는 발화 시간 기반(heuristic)으로
-    발화자/상대방을 식별하고, 성별·연령·관계를 분석합니다.
+    발화자/상대방을 식별하고, 성별·관계를 분석합니다(연령은 연락처 단위 자기신고/프로필로 산출).
     """
 
     speaker_label: str = Field(..., description="화자 레이블 (SPEAKER_00, ...)", examples=["SPEAKER_00"])
     speaker_role: Optional[str] = Field(None, description="'self'(발화자) | 'other'(상대방)", examples=["self"])
     speaker_role_source: Optional[str] = Field(None, description="'profile_match' | 'heuristic'", examples=["profile_match"])
     speaker_gender: Optional[str] = Field(None, description="'male' | 'female' | null(미상)", examples=["male"])
-    speaker_voice_age_range: Optional[str] = Field(None, description="목소리 연령대 (20대|30대|40대|50대+|null)", examples=["30대"])
-    speaker_speech_age_range: Optional[str] = Field(None, description="말투 연령대 (20대|30대|40대|50대+|null)", examples=["30대"])
-    speaker_speech_age_model_version: Optional[str] = Field(None, description="말투 연령 예측 모델 버전", examples=["v20250513_120000"])
+    # 연령(목소리/말투)은 degenerate 라 폐기 — 연령대는 연락처 단위(self=프로필·peer=자가신고)로 산출.
     speaker_relation: Optional[str] = Field(None, description="관계 ('부모'|'배우자'|'친구'|'직장상사'|'교사'|'형제자매'|null)", examples=["부모"])
 
 

@@ -1318,9 +1318,6 @@ def transcribe(
                         "speaker_role": r.speaker_role,
                         "speaker_role_source": r.speaker_role_source,
                         "speaker_gender": r.speaker_gender,
-                        "speaker_voice_age_range": r.speaker_voice_age_range,
-                        "speaker_speech_age_range": r.speaker_speech_age_range,
-                        "speaker_speech_age_model_version": r.speaker_speech_age_model_version,
                         "speaker_relation": r.speaker_relation,
                     }
                     for r in speaker_results.values()
@@ -1332,7 +1329,7 @@ def transcribe(
         # 청크 모드 화자행 갭 수정(2026-06-27): audio=None 이라 librosa/embedding 불가 →
         # segments duration 휴리스틱으로 self/other 역할만 부여해 session_speakers 행 생성.
         # (없으면 장통화 139세션이 화자행 0 → 발화 self/other 귀속 불가.)
-        # gender/age 는 None — self=프로필(worker self-skip)·peer=자가신고에서 채움.
+        # gender 는 None — self=프로필(worker self-skip)·peer 추론에서 채움. 연령은 폐기(연락처단위 산출).
         if enable_diarize and diarize_active and use_chunked and segments and speakers_result is None:
             try:
                 from app.services.speaker_analysis_service import _is_human
@@ -1349,9 +1346,6 @@ def transcribe(
                         "speaker_role": "self" if lbl == _self else "other",
                         "speaker_role_source": "chunk_duration_heuristic",
                         "speaker_gender": None,
-                        "speaker_voice_age_range": None,
-                        "speaker_speech_age_range": None,
-                        "speaker_speech_age_model_version": None,
                         "speaker_relation": None,
                     }
                     for lbl in _dur

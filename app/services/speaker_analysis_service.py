@@ -43,7 +43,11 @@ _SALUTATION_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"형|누나|언니|오빠|남동생|여동생"), "형제자매"),
     (re.compile(r"사장님|대표님|회장님"), "직장상사"),
     (re.compile(r"부장님|과장님|팀장님|차장님|실장님|본부장님"), "직장상사"),
-    (re.compile(r"선생님|교수님|교수|선생"), "교사"),
+    # "선생님/선생"은 고객상담 등에서 쓰이는 일반 존칭(호격)이라 교사 오분류 주범 →
+    # 직업 특정적인 "교수님/교수"만 교사로 매핑(2026-06-06, 항공예약콜 교사 오분류 사례).
+    # ⚠️ 잔여: LLM(relation_inference) 경로도 교사 출력 가능 → 대화목적·주제 교차검증으로
+    #    저확률 관계 재검토 필요(후속). "선생님"이 진짜 교사인 경우는 그 교차검증에서 복원.
+    (re.compile(r"교수님|교수"), "교사"),
     (re.compile(r"친구야|친구|야|어이"), "친구"),
 ]
 
@@ -58,9 +62,7 @@ class SpeakerAnalysisResult:
     speaker_role: str | None = None          # 'self' | 'other'
     speaker_role_source: str | None = None   # 'profile_match' | 'heuristic'
     speaker_gender: str | None = None        # 'male' | 'female'
-    speaker_voice_age_range: str | None = None  # '20대'|'30대'|'40대'|'50대+'
-    speaker_speech_age_range: str | None = None
-    speaker_speech_age_model_version: str | None = None
+    # 연령(목소리/말투)은 degenerate 라 폐기 — 연령대는 연락처 단위(self=프로필·peer=자가신고)로 산출.
     speaker_relation: str | None = None
 
 
@@ -313,7 +315,9 @@ def analyze_speakers(
     for lbl in speaker_labels:
         role = "self" if lbl == self_label else "other"
         chunk = _extract_speaker_audio(audio, sample_rate, segments, lbl)
-        gender, voice_age = _detect_gender_and_voice_age(chunk, sample_rate)
+        # 연령(목소리/말투)은 degenerate(전화 8kHz 음향 불가·말투모델 상수붕괴)라 폐기.
+        # 연령대는 연락처 단위(self=프로필·peer=자가신고)로 export 시 산출 → 여기선 산출 안 함.
+        gender, _ = _detect_gender_and_voice_age(chunk, sample_rate)
 
         pre_texts = pre_mask_texts_by_speaker.get(lbl, [])
         # 관계 추정은 other '사람' 화자에만 부여(IVR 안내멘트는 관계 대상 아님).
@@ -322,16 +326,12 @@ def analyze_speakers(
             _detect_relation(pre_texts, pre_mask_texts_by_speaker)
             if role == "other" and _is_human(lbl) else None
         )
-        speech_age, speech_age_ver = _detect_speech_age(pre_texts) if pre_texts else (None, None)
 
         results[lbl] = SpeakerAnalysisResult(
             speaker_label=lbl,
             speaker_role=role,
             speaker_role_source=role_source if lbl == self_label else "heuristic",
             speaker_gender=gender,
-            speaker_voice_age_range=voice_age,
-            speaker_speech_age_range=speech_age,
-            speaker_speech_age_model_version=speech_age_ver,
             speaker_relation=relation,
         )
 

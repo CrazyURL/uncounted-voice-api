@@ -571,19 +571,20 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     run_start_iso = _now_iso()
 
     # ── STAGE 15: session_speakers ────────────────────────────────────────
-    # self(본인) demographics 는 librosa(전화음성 F0 오판) 대신 users_profile(자기신고)에서.
+    # self(본인) gender 는 librosa(전화음성 F0 오판) 대신 users_profile(자기신고)에서.
     # 본인은 화자가 안 바뀌므로 프로필이 ground-truth — 통화마다 성별이 뒤집히는 문제 차단.
     # 하드코딩 아님: user_id 로 프로필 조회해 매핑. 프로필 없으면 기존 librosa 값 유지(무회귀).
+    # ★연령: 목소리/말투 음향·텍스트 추론은 degenerate(쓰레기)라 폐기. 연령대는 연락처 단위로
+    #   self=users_profile.age_band / peer=peers.age_band(동의 자가신고)에서 export 시 산출 →
+    #   worker 는 session_speakers 에 연령을 더 이상 쓰지 않는다(컬럼 drop 과도 호환).
     _self_gender_en: str | None = None
-    _self_voice_age: str | None = None
     try:
         _prof_res = await _run(
             lambda: _supabase.table("users_profile")
-            .select("gender, age_band").eq("user_id", user_id).limit(1).execute()
+            .select("gender").eq("user_id", user_id).limit(1).execute()
         )
         _prof = (_prof_res.data or [{}])[0]
         _self_gender_en = {"남성": "male", "여성": "female", "논바이너리": "non_binary"}.get(_prof.get("gender"))
-        _self_voice_age = _prof.get("age_band") or None
     except Exception as e:
         log.warning("[%s] self-skip 프로필 조회 실패(기존 값 유지): %s", session_id, e)
 
@@ -592,21 +593,14 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     for spk in speakers_data:
         _is_self = spk.get("speaker_role") == "self"
         _gender = spk.get("speaker_gender")
-        _voice_age = spk.get("speaker_voice_age_range")
-        if _is_self:
-            if _self_gender_en:
-                _gender = _self_gender_en
-            if _self_voice_age:
-                _voice_age = _self_voice_age
+        if _is_self and _self_gender_en:
+            _gender = _self_gender_en
         spk_row = {
             "session_id": session_id,
             "speaker_label": spk["speaker_label"],
             "speaker_role": spk.get("speaker_role"),
             "speaker_role_source": spk.get("speaker_role_source"),
             "speaker_gender": _gender,
-            "speaker_voice_age_range": _voice_age,
-            "speaker_speech_age_range": spk.get("speaker_speech_age_range"),
-            "speaker_speech_age_model_version": spk.get("speaker_speech_age_model_version"),
             "speaker_relation": spk.get("speaker_relation"),
         }
         try:
