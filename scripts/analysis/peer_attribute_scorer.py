@@ -137,7 +137,79 @@ def score_peer(pid, title, cur_rel, cur_src):
 
 HUMAN_SRC = ('ground_truth_consented', 'human', 'human_locked', 'manual_correction')
 
+# ── 관계 교차검증: peer_stated 자가신고(ground truth·값불변) vs 호칭·화계 ──
+# 스펙: relationship 값은 override_locked 라 절대 안 덮음. attr_state 만 갱신.
+#   일치=peer_stated_verified / 신호無=peer_stated_unverified(초기값) / 충돌=peer_stated_flagged.
+# 호칭(녹음에 박혀 조작불가)=최강축, 화계(가족반말 vs 업무존대)=보조축. 약하면 unverified(틀린flag<놓침).
+FAMILY_RELS = {'부모', '배우자', '형제자매', '자녀', '친구'}
+WORK_RELS = {'직장상사', '직장동료', '거래처', '교사', '고객'}
+
+
+def cross_check_verdict(rel, hw, hw_conf, p2o, o2p):
+    sib = p2o['오빠'] + p2o['누나'] + p2o['형'] + p2o['언니']   # peer→owner 형제 호칭
+    par = o2p['아빠'] + o2p['엄마'] + o2p['아버지'] + o2p['어머니']  # owner→peer 부모 호칭
+    # 최강축 = 구체 친족 호칭(조작불가). 가족관계는 화계로 flag 금지:
+    #   부모는 자녀→부모 존대가 정상, 친구는 존/반말 혼재라 화계 대조가 오탐.
+    if rel == '형제자매':
+        if sib >= 2: return 'peer_stated_verified'
+        if par >= 2: return 'peer_stated_flagged'   # 부모 호칭인데 형제자매 신고=충돌
+        return 'peer_stated_unverified'
+    if rel == '부모':
+        if par >= 2: return 'peer_stated_verified'
+        if sib >= 2: return 'peer_stated_flagged'
+        return 'peer_stated_unverified'             # 존대여도 flag 안 함(부모 존대=정상)
+    # 화계축 = 업무관계만 신뢰(존대 규범 뚜렷). 상호반말(가족신호)이면 공식관계와 충돌.
+    if rel in WORK_RELS and hw:
+        if hw == '업무' and hw_conf >= 0.6: return 'peer_stated_verified'
+        if hw == '가족' and hw_conf >= 0.7: return 'peer_stated_flagged'
+    return 'peer_stated_unverified'   # 친구/배우자/자녀/기타·신호약함 → 초기값 유지(틀린flag<놓침)
+
+
+def cross_check(apply):
+    peers = get("peers?select=id,display_name,relationship,rel_source,attr_state&rel_source=eq.peer_stated")
+    print(f"=== 관계 교차검증(rel_source=peer_stated): {len(peers)}건 ===")
+    if not peers:
+        print("peer_stated 자가신고 데이터 없음 — 동의페이지 관계 자가신고 적재 후 실행(현재 정상).")
+        return 0
+    out = Counter(); wrote = 0
+    for p in peers:
+        rel = p.get('relationship')
+        if not rel:
+            continue
+        hw, hw_conf, p2o, o2p = hwagye_hochik(p['id'])
+        v = cross_check_verdict(rel, hw, hw_conf, p2o, o2p)
+        out[v] += 1
+        sib = p2o['오빠'] + p2o['누나'] + p2o['형'] + p2o['언니']
+        par = o2p['아빠'] + o2p['엄마'] + o2p['아버지'] + o2p['어머니']
+        print(f"  {p['id'][:8]} rel={rel} hw={hw}({hw_conf}) sib={sib} par={par} → {v}")
+        if apply and v != p.get('attr_state'):
+            patch(p['id'], {'attr_state': v})   # ★attr_state 만. relationship/override_locked/rel_confidence 불변.
+            wrote += 1
+    print("판정:", dict(out))
+    print(f"attr_state 갱신 {wrote}건 (값·잠금 불변)" if apply else "[DRY] --apply 로 attr_state 갱신")
+    return 0
+
+
+def validate_xcheck():
+    # 로직 검증(읽기전용): 기존 라벨 peer(관계 있는 것)를 자가신고로 가정해 판정 확인.
+    peers = get("peers?select=id,relationship,rel_source&relationship=not.is.null&limit=200")
+    peers = [p for p in peers if p.get('relationship') not in (None, 'UNKNOWN')]
+    print(f"=== [검증·읽기전용] 기존 라벨 peer {len(peers)}건에 판정 로직 적용 ===")
+    ok = Counter()
+    for p in peers:
+        hw, hw_conf, p2o, o2p = hwagye_hochik(p['id'])
+        v = cross_check_verdict(p['relationship'], hw, hw_conf, p2o, o2p)
+        ok[v] += 1
+        sib = p2o['오빠'] + p2o['누나'] + p2o['형'] + p2o['언니']; par = o2p['아빠'] + o2p['엄마'] + o2p['아버지'] + o2p['어머니']
+        print(f"  {p['id'][:8]} rel={p['relationship']}({p.get('rel_source')}) hw={hw} sib={sib} par={par} → {v}")
+    print("판정 분포:", dict(ok))
+    return 0
+
 def main():
+    if "--cross-check" in sys.argv:
+        return cross_check("--apply" in sys.argv)
+    if "--validate-xcheck" in sys.argv:
+        return validate_xcheck()
     apply = "--apply" in sys.argv
     peers = get("peers?select=id,relationship,rel_source,override_locked&order=call_count.desc")
     results = []
