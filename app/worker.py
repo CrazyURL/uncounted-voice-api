@@ -6,6 +6,7 @@ Run as a standalone process on the GPU server alongside uncounted-voice-api.
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import signal
@@ -210,9 +211,36 @@ def build_submit_params() -> dict:
     return params
 
 
-async def submit_to_voice_api(audio_path: str) -> str:
-    """POST audio file to voice_api; return task_id. 503 → Voice503Error."""
+async def fetch_reference_embedding(user_id: str) -> Optional[list]:
+    """소유자 성문(voice_profiles.reference_embedding) 조회 → 화자식별 profile_match 용.
+
+    없거나 enrollment_status != 'enrolled' 이면 None → 기존 longest-speaker heuristic 폴백(무회귀).
+    이게 없으면 speaker_analysis 가 항상 heuristic 으로만 self 를 고른다(role 정확도 상한).
+    """
+    try:
+        res = await _run(
+            lambda: _supabase.table("voice_profiles")
+            .select("reference_embedding, enrollment_status")
+            .eq("user_id", user_id).limit(1).execute()
+        )
+        row = (res.data or [{}])[0]
+        if row.get("enrollment_status") != "enrolled":
+            return None
+        emb = row.get("reference_embedding")
+        return emb if isinstance(emb, list) and emb else None
+    except Exception as e:  # noqa: BLE001 — 조회 실패는 폴백(처리 중단 금지)
+        log.warning("voice_profiles 조회 실패(heuristic 폴백): %s", e)
+        return None
+
+
+async def submit_to_voice_api(audio_path: str, reference_embedding: Optional[list] = None) -> str:
+    """POST audio file to voice_api; return task_id. 503 → Voice503Error.
+
+    reference_embedding 전달 시 voice-api 가 profile_match(cosine)로 self 를 식별한다.
+    """
     params = build_submit_params()
+    if reference_embedding:
+        params["reference_embedding"] = json.dumps(reference_embedding)
     url = f"{VOICE_API_URL}/api/v1/transcribe"
     ext = audio_path.rsplit(".", 1)[-1].lower() if "." in audio_path else "wav"
     with open(audio_path, "rb") as f:
@@ -1067,7 +1095,11 @@ async def process_one_session() -> str:
         audio_path = await download_raw_audio(session["raw_audio_url"])
         log.info("[%s] audio downloaded to %s", session_id, audio_path)
 
-        task_id = await submit_to_voice_api(audio_path)
+        # 소유자 성문 → profile_match 화자식별(없으면 None=heuristic 폴백, 무회귀)
+        ref_emb = await fetch_reference_embedding(session["user_id"])
+        if ref_emb:
+            log.info("[%s] reference_embedding 적용(dim=%d) → profile_match", session_id, len(ref_emb))
+        task_id = await submit_to_voice_api(audio_path, ref_emb)
         log.info("[%s] submitted → task_id %s", session_id, task_id)
 
         job_result = await poll_job(task_id)
